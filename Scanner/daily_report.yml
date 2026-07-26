@@ -1,0 +1,36 @@
+name: Daily Market Report
+
+on:
+  schedule:
+    # 10:30 UTC = 4:00 PM IST, Monday-Friday
+    - cron: '30 10 * * 1-5'
+  workflow_dispatch: {}
+
+jobs:
+  daily-report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install yfinance pandas openpyxl numpy requests scikit-learn
+
+      - name: Run daily report (scans + emails you)
+        env:
+          GMAIL_SENDER: ${{ secrets.GMAIL_SENDER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+        run: python send_daily_report.py trading_toolkit.xlsx nifty500.csv niftysmallcap250.csv
+
+      - name: Upload updated workbook as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trading_toolkit
+          path: trading_toolkit.xlsx
+          retention-days: 14
