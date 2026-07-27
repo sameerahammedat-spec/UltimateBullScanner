@@ -14,6 +14,9 @@ jobs:
     # run considerably longer than earlier versions of this workflow.
     # Explicit cap so a stuck run doesn't silently burn Actions minutes.
     timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: Scanner
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -55,5 +58,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: trading_toolkit
-          path: trading_toolkit.xlsx
+          path: Scanner/trading_toolkit.xlsx
           retention-days: 14
