@@ -31,7 +31,7 @@ from openpyxl.utils import get_column_letter
 
 from market_scanner import (
     FONT, BLACK, HDR_FONT, HDR_FILL, SEC_FILL, SEC_FONT, ALT_FILL, BORDER,
-    load_universe, analyze_symbol, get_nifty_returns, score_row, verdict, TOP_N_DEEPDIVE,
+    load_universe, analyze_symbol, analyze_universe_parallel, get_nifty_returns, score_row, verdict, TOP_N_DEEPDIVE,
 )
 from chart_patterns import detect_pattern, BULLISH_PATTERNS
 
@@ -63,18 +63,9 @@ def run_bse1000_scan(universe_paths, verbose=True):
     nifty_1m, nifty_3m = get_nifty_returns()
 
     results = []
-    for i, sym in enumerate(symbols, 1):
-        if verbose:
-            print(f"[{i}/{len(symbols)}] {sym}...", end=" ", flush=True)
-        try:
-            d = analyze_symbol(sym, nifty_1m, nifty_3m, return_series=True)
-        except Exception as e:
-            if verbose:
-                print(f"SKIPPED ({e})")
-            continue
+    fetched = analyze_universe_parallel(symbols, nifty_1m, nifty_3m, return_series=True, verbose=verbose)
+    for sym, d in fetched.items():
         if d is None or not d.get("liquidity_ok"):
-            if verbose:
-                print("SKIPPED (no data / illiquid)")
             continue
 
         d["symbol"] = sym
@@ -84,6 +75,10 @@ def run_bse1000_scan(universe_paths, verbose=True):
         d["verdict"] = verdict(d["score"])
         d["turnover_cr"] = (d["close"] * d["volume"]) / 1e7 if (d["close"] and d["volume"]) else None
 
+        # Pattern detection is pure CPU/numpy work (no network), so it runs
+        # fast in the main thread after all the network fetching is done -
+        # no benefit to parallelizing this part, and cv2 objects aren't
+        # guaranteed thread-safe to share across worker threads anyway.
         pattern_result = detect_pattern(d["close_series"], d["volume_series"])
         d["pattern"] = pattern_result["pattern"]
         d["pattern_confidence"] = pattern_result["confidence"]
@@ -91,9 +86,6 @@ def run_bse1000_scan(universe_paths, verbose=True):
         d["is_spike_warning"] = pattern_result["is_spike_warning"]
 
         results.append(d)
-        if verbose:
-            print(f"Score={d['score']} Pattern={d['pattern']}")
-        time.sleep(0.25)
 
     full_scan = sorted(results, key=lambda r: r["score"], reverse=True)
     deep_dive = [d for d in full_scan if d["verdict"] in ("STRONG SETUP", "WATCHLIST")][:TOP_N_DEEPDIVE]

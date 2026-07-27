@@ -33,6 +33,7 @@ Usage:
 import sys
 import time
 import pickle
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 import pandas as pd
 import numpy as np
@@ -60,6 +61,14 @@ MIN_VOLUME = 50000
 NIFTY_TICKER = "^NSEI"
 TOP_N_DEEPDIVE = 25   # how many top-ranked stocks get the full deep-dive treatment
 
+# Parallel fetch settings. Yahoo Finance is the bottleneck (one network round-trip
+# per symbol), not the CSV/merge step - this is what actually speeds up a 250-1000
+# stock scan. Higher = faster, but too high risks Yahoo rate-limiting/blocking you
+# mid-scan, which then shows up as a wave of "SKIPPED (no data)" you wouldn't
+# otherwise get. Start at 15; if you see failures climb, drop it, don't raise it.
+MAX_WORKERS = 15
+FETCH_RETRIES = 1   # one retry on transient failures (timeouts, momentary rate limits)
+
 HEADERS = ["Symbol", "Name", "Sector", "Cap Segment", "Close", "% Chg", "Volume",
            "Vol Ratio (vs 3d avg)", "Mkt Cap (Cr)",
            "Liquidity OK?", "Above 50DMA?", "Above 200DMA?", "RSI(14)", "RSI Healthy?",
@@ -71,6 +80,7 @@ HEADERS = ["Symbol", "Name", "Sector", "Cap Segment", "Close", "% Chg", "Volume"
 DEEPDIVE_HEADERS = ["Symbol", "Name", "Cap Segment", "Close", "Score", "Verdict",
                      "Vol Ratio (vs 3d avg)", "ADX(14)", "Trend Strength",
                      "Trend Direction", "20d Slope %/day", "Trend R^2",
+                     "Trend Quality (ADX x R^2)",
                      "Entry", "Stop Loss", "Target 1", "Target 2", "Risk:Reward T1/T2"]
 
 
@@ -141,6 +151,29 @@ def to_scalar(x):
     return float(x)
 
 
+def fetch_history(nse_symbol, period="1y"):
+    """Tries the NSE listing (.NS) first since it's usually more liquid/reliable
+    on Yahoo Finance; falls back to the BSE listing (.BO) if the stock isn't on
+    NSE at all (common for smaller BSE-only smallcaps). Retries once per
+    exchange on transient failures (common when running many threads at once).
+    Returns (df, ticker_str) or (None, None)."""
+    for suffix in (".NS", ".BO"):
+        ticker_str = nse_symbol.strip() + suffix
+        for attempt in range(FETCH_RETRIES + 1):
+            try:
+                tk = yf.Ticker(ticker_str)
+                df = tk.history(period=period, interval="1d", auto_adjust=True)
+                if not df.empty and len(df) >= 60:
+                    return df, ticker_str, tk
+                break  # empty result isn't transient - move to next suffix, don't retry
+            except Exception:
+                if attempt < FETCH_RETRIES:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                break
+    return None, None, None
+
+
 def get_nifty_returns():
     tk = yf.Ticker(NIFTY_TICKER)
     df = tk.history(period="1y", interval="1d", auto_adjust=True)
@@ -150,14 +183,9 @@ def get_nifty_returns():
     return ret_1m, ret_3m
 
 
-def analyze_symbol(nse_symbol, nifty_1m, nifty_3m):
-    ticker_str = nse_symbol.strip() + ".NS"
-    try:
-        tk = yf.Ticker(ticker_str)
-        df = tk.history(period="1y", interval="1d", auto_adjust=True)
-        if df.empty or len(df) < 60:
-            return None
-    except Exception:
+def analyze_symbol(nse_symbol, nifty_1m, nifty_3m, return_series=False):
+    df, ticker_str, tk = fetch_history(nse_symbol)
+    if df is None:
         return None
 
     if isinstance(df.columns, pd.MultiIndex):
@@ -174,10 +202,16 @@ def analyze_symbol(nse_symbol, nifty_1m, nifty_3m):
     atr14 = to_scalar(atr(df, 14).iloc[-1])
     adx14 = to_scalar(adx(df, 14).iloc[-1])
     slope_pct, r2 = trend_regression(close, 20)
+    # Trend Quality Score: strength (ADX, 0-100) weighted by how clean/consistent
+    # the trend is (R^2, 0-1). A stock can have high ADX but low R^2 (a couple of
+    # violent single-day moves, not a real trend) or vice versa; this single
+    # number rewards only the combination of BOTH being high.
+    trend_quality = (adx14 * r2) if (adx14 is not None and r2 is not None) else None
 
     avg_vol_20 = to_scalar(volume.rolling(20).mean().iloc[-1])
     last_vol = to_scalar(volume.iloc[-1])
     vol_spike = (last_vol is not None and avg_vol_20 and last_vol > 1.5 * avg_vol_20)
+    vol_ratio_20d = (last_vol / avg_vol_20) if (last_vol is not None and avg_vol_20) else None
 
     # Volume ratio: today vs avg of the PRIOR 3 days (excludes today itself)
     vol_ratio_3d = None
@@ -230,15 +264,16 @@ def analyze_symbol(nse_symbol, nifty_1m, nifty_3m):
             target2 = entry - 3.0 * atr14
         risk_reward = "1:1 / 1:2"  # 1.5 ATR risk vs 1.5/3.0 ATR reward
 
-    return dict(
+    result = dict(
         close=last_close, pct_change=pct_change, volume=last_vol, mkt_cap_cr=mkt_cap_cr,
-        vol_ratio_3d=vol_ratio_3d,
+        vol_ratio_3d=vol_ratio_3d, vol_ratio_20d=vol_ratio_20d,
         liquidity_ok=(last_vol is not None and last_vol >= MIN_VOLUME),
         above_50dma=(dma50 is not None and last_close > dma50),
         above_200dma=(dma200 is not None and last_close > dma200) if dma200 is not None else None,
         rsi=rsi14, rsi_healthy=(rsi14 is not None and 50 <= rsi14 <= 70), atr=atr14,
         adx=adx14, trend_strength=trend_strength_label(adx14),
         trend_direction=trend_direction, trend_slope_pct=slope_pct, trend_r2=r2,
+        trend_quality=trend_quality,
         entry=entry, stop_loss=stop_loss, target1=target1, target2=target2, risk_reward=risk_reward,
         vol_spike=vol_spike, down_from_high=down_from_high,
         near_high=(down_from_high is not None and down_from_high <= 10),
@@ -246,6 +281,49 @@ def analyze_symbol(nse_symbol, nifty_1m, nifty_3m):
         pe=pe, roe=roe, roe_ok=(roe is not None and roe > 15), debt_equity=debt_equity,
         qoq_growth=qoq_growth, qoq_ok=(qoq_growth is not None and qoq_growth > 0),
     )
+    if return_series:
+        result["close_series"] = close.values
+        result["volume_series"] = volume.values
+    return result
+
+
+def analyze_universe_parallel(symbols, nifty_1m, nifty_3m, return_series=False,
+                               max_workers=MAX_WORKERS, verbose=True):
+    """Runs analyze_symbol() across all symbols concurrently using a thread
+    pool. This is an I/O-bound workload (waiting on Yahoo Finance's servers,
+    not CPU), which is exactly the case where Python threads help despite the
+    GIL - each thread releases it while blocked on network I/O. Returns a
+    dict {symbol: result_dict_or_None}, in completion order (not input order -
+    callers re-sort by score/rank anyway, so this doesn't matter downstream).
+    """
+    results = {}
+    total = len(symbols)
+    completed = 0
+    ok_count = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_symbol = {
+            executor.submit(analyze_symbol, sym, nifty_1m, nifty_3m, return_series): sym
+            for sym in symbols
+        }
+        for future in as_completed(future_to_symbol):
+            sym = future_to_symbol[future]
+            completed += 1
+            try:
+                d = future.result()
+            except Exception as e:
+                d = None
+                if verbose:
+                    print(f"[{completed}/{total}] {sym}: ERROR ({e})")
+            else:
+                if d is not None:
+                    ok_count += 1
+                if verbose and (completed % 25 == 0 or completed == total):
+                    print(f"[{completed}/{total}] fetched, {ok_count} usable so far "
+                          f"(last: {sym} {'OK' if d else 'no data'})")
+            results[sym] = d
+
+    return results
 
 
 def score_row(d):
@@ -265,23 +343,32 @@ def verdict(score):
 
 def find_col(df, names):
     for c in df.columns:
-        if c.strip().lower() in names:
-            return c
+        cl = c.strip().lower()
+        for n in names:
+            if n == cl or n in cl:
+                return c
     return None
 
 
 def load_universe(paths):
-    """Loads and merges universe CSVs. Also tags each symbol's Cap Segment
-    based on whether it appears in a file whose name contains 'smallcap'."""
+    """Loads and merges universe CSVs. Tags each symbol's Cap Segment based on
+    which source file(s) it came from:
+      - filename contains 'bse' AND 'smallcap'  -> "BSE Smallcap"
+      - filename contains 'smallcap' (not bse)  -> "NSE Smallcap"
+      - otherwise                                -> "Large/Midcap"
+    If a symbol appears in more than one smallcap file, BSE Smallcap wins the
+    label (since that's usually the more specific/relevant tag when a stock is
+    also NSE-listed)."""
     frames = []
-    smallcap_symbols = set()
+    nse_smallcap_symbols = set()
+    bse_smallcap_symbols = set()
     for p in paths:
         df = pd.read_csv(p)
-        sym_col = find_col(df, ("symbol", "nse code", "nsecode", "ticker"))
+        sym_col = find_col(df, ("symbol", "nse code", "nsecode", "ticker", "security id", "scrip code"))
         if not sym_col:
             print(f"  [!] Skipping {p}: no Symbol column found ({list(df.columns)})")
             continue
-        name_col = find_col(df, ("company name", "name", "stock name"))
+        name_col = find_col(df, ("company name", "name", "stock name", "security name", "constituents"))
         sector_col = find_col(df, ("industry", "sector"))
         syms = df[sym_col].astype(str).str.strip()
         out = pd.DataFrame({
@@ -290,11 +377,22 @@ def load_universe(paths):
             "sector": df[sector_col].astype(str).str.strip() if sector_col else "",
         })
         frames.append(out)
-        if "smallcap" in p.lower():
-            smallcap_symbols.update(syms.tolist())
+        fname = p.lower()
+        if "smallcap" in fname and "bse" in fname:
+            bse_smallcap_symbols.update(syms.tolist())
+        elif "smallcap" in fname:
+            nse_smallcap_symbols.update(syms.tolist())
 
     merged = pd.concat(frames, ignore_index=True).drop_duplicates(subset="symbol")
-    merged["cap_segment"] = merged["symbol"].apply(lambda s: "Smallcap" if s in smallcap_symbols else "Large/Midcap")
+
+    def tag(s):
+        if s in bse_smallcap_symbols:
+            return "BSE Smallcap"
+        if s in nse_smallcap_symbols:
+            return "NSE Smallcap"
+        return "Large/Midcap"
+
+    merged["cap_segment"] = merged["symbol"].apply(tag)
     return merged
 
 
@@ -381,6 +479,7 @@ def write_deepdive_table(ws, start_row, rows, title=None):
                 d["score"], d["verdict"], num(d.get("vol_ratio_3d"), 2), num(d.get("adx"), 1),
                 d.get("trend_strength", "N/A"), d.get("trend_direction", "N/A"),
                 num(d.get("trend_slope_pct"), 2), num(d.get("trend_r2"), 2),
+                num(d.get("trend_quality"), 1),
                 num(d.get("entry"), 2), num(d.get("stop_loss"), 2),
                 num(d.get("target1"), 2), num(d.get("target2"), 2), d.get("risk_reward", "N/A")]
         for c, v in enumerate(vals, start=1):
@@ -409,22 +508,11 @@ def run_scan(xlsx_path, universe_paths, verbose=True):
         print(f"Nifty 1M: {nifty_1m:.2f}%  |  Nifty 3M: {nifty_3m:.2f}%\n")
 
     results = []
-    for i, sym in enumerate(symbols, 1):
-        if verbose:
-            print(f"[{i}/{len(symbols)}] {sym}...", end=" ", flush=True)
-        try:
-            d = analyze_symbol(sym, nifty_1m, nifty_3m)
-        except Exception as e:
-            if verbose:
-                print(f"SKIPPED ({e})")
-            continue
+    fetched = analyze_universe_parallel(symbols, nifty_1m, nifty_3m, verbose=verbose)
+    for sym, d in fetched.items():
         if d is None:
-            if verbose:
-                print("SKIPPED (no data)")
             continue
         if not d["liquidity_ok"]:
-            if verbose:
-                print("SKIPPED (below liquidity cutoff)")
             continue
         d["symbol"] = sym
         d["name"] = meta.get(sym, {}).get("name", sym)
@@ -433,9 +521,6 @@ def run_scan(xlsx_path, universe_paths, verbose=True):
         d["score"] = score_row(d)
         d["verdict"] = verdict(d["score"])
         results.append(d)
-        if verbose:
-            print(f"Score={d['score']} -> {d['verdict']}")
-        time.sleep(0.25)
 
     full_scan = sorted(results, key=lambda x: x["score"], reverse=True)
     early_momentum = sorted(

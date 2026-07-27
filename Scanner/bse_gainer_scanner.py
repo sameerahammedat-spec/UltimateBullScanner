@@ -37,7 +37,7 @@ from openpyxl.utils import get_column_letter
 
 from market_scanner import (
     FONT, BLACK, BLACK_B, HDR_FONT, HDR_FILL, SEC_FILL, SEC_FONT, ALT_FILL, BORDER,
-    load_universe, analyze_symbol, get_nifty_returns, score_row, verdict,
+    load_universe, analyze_symbol, analyze_universe_parallel, get_nifty_returns, score_row, verdict,
 )
 
 MIN_GAIN_PCT = 5.0
@@ -118,22 +118,11 @@ def run_gainer_scan(universe_paths, verbose=True):
     nifty_1m, nifty_3m = get_nifty_returns()
 
     gainers = []
-    for i, sym in enumerate(symbols, 1):
-        if verbose:
-            print(f"[{i}/{len(symbols)}] {sym}...", end=" ", flush=True)
-        try:
-            d = analyze_symbol(sym, nifty_1m, nifty_3m)
-        except Exception as e:
-            if verbose:
-                print(f"SKIPPED ({e})")
-            continue
+    fetched = analyze_universe_parallel(symbols, nifty_1m, nifty_3m, verbose=verbose)
+    for sym, d in fetched.items():
         if d is None or d["pct_change"] is None:
-            if verbose:
-                print("SKIPPED (no data)")
             continue
         if not (MIN_GAIN_PCT <= d["pct_change"] <= MAX_GAIN_PCT):
-            if verbose:
-                print(f"pct_chg={d['pct_change']:.1f}% - outside {MIN_GAIN_PCT}-{MAX_GAIN_PCT}% band")
             continue
 
         d["symbol"] = sym
@@ -144,9 +133,6 @@ def run_gainer_scan(universe_paths, verbose=True):
         d["verdict"] = verdict(d["score"])
         d["turnover_cr"] = (d["close"] * d["volume"]) / 1e7 if (d["close"] and d["volume"]) else None
         gainers.append(d)
-        if verbose:
-            print(f"GAIN {d['pct_change']:.1f}% -> included")
-        time.sleep(0.25)
 
     gainers = sorted(gainers, key=lambda x: x["pct_change"], reverse=True)
 

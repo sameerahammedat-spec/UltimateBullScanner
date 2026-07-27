@@ -26,6 +26,7 @@ USAGE:
 """
 
 import sys
+import warnings
 import pandas as pd
 
 
@@ -33,13 +34,28 @@ def find_col(df, candidates):
     for c in df.columns:
         cl = c.strip().lower()
         for cand in candidates:
-            if cand == cl or cand in cl:
+            # bidirectional substring check: catches both "Macro-Economic Sector"
+            # (header contains the candidate) and "COMPANY" (candidate "company name"
+            # contains the header) - a one-directional check misses the second case.
+            if cand == cl or cand in cl or cl in cand:
                 return c
     return None
 
 
+def read_csv_safely(path):
+    """BSE's own CSV exports sometimes have MORE comma-separated fields per data
+    row than the header has column names (trailing blank columns from their
+    export tool). pandas' default behavior in that case is to silently assume
+    the *extra* fields are a row index - which shifts every single column's
+    values without raising an error. index_col=False disables that guess so
+    columns line up with their actual header names."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # the resulting "length mismatch" warning is expected/harmless here
+        return pd.read_csv(path, index_col=False)
+
+
 def load_scrip_master(path):
-    df = pd.read_csv(path)
+    df = read_csv_safely(path)
     code_col = find_col(df, ("security code", "scrip code", "bse code"))
     sym_col = find_col(df, ("security id", "scrip id", "trading symbol"))
     status_col = find_col(df, ("status",))
@@ -60,8 +76,8 @@ def load_scrip_master(path):
 
 
 def fix_universe_file(master, index_csv_path):
-    df = pd.read_csv(index_csv_path)
-    name_col = find_col(df, ("company name", "constituents", "name", "security name"))
+    df = read_csv_safely(index_csv_path)
+    name_col = find_col(df, ("company name", "company", "constituents", "name", "security name"))
     code_col = find_col(df, ("symbol", "scrip code", "security code"))
     sector_col = find_col(df, ("sector", "industry"))
 
