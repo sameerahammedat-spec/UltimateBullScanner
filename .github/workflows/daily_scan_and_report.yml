@@ -43,14 +43,14 @@ jobs:
         run: python bse_gainer_scanner.py trading_toolkit.xlsx bse_smallcap250_clean.csv
 
       - name: Run BSE 1000 scan (chart patterns + Ultra Top Picks)
-        run: python bse1000_scanner.py trading_toolkit.xlsx bse_full_universe.csv
+        run: python bse1000_scanner.py trading_toolkit.xlsx bse1000_clean.csv
 
       - name: Send consolidated email report
         if: always()   # still try to email whatever succeeded, even if one scanner above failed
         env:
           GMAIL_SENDER: ${{ secrets.GMAIL_SENDER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-          REPORT_RECIPIENT: lightsoul.n@gmail.com
+          REPORT_RECIPIENT: sa2337308@gmail.com
         run: python send_scan_report.py trading_toolkit.xlsx
 
       - name: Upload updated workbook as artifact
