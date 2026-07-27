@@ -1,0 +1,8 @@
+pandas
+numpy
+openpyxl
+yfinance
+requests
+# Only needed if you add bse1000_scanner.py + chart_patterns.py (Ultra Top Picks / OpenCV patterns):
+# scipy
+# opencv-python-headless
