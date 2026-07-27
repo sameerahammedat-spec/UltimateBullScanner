@@ -1,0 +1,59 @@
+name: Daily Scan and Report
+
+on:
+  schedule:
+    # 10:15 UTC = 3:45 PM IST, Monday-Friday (just after market close)
+    - cron: '15 10 * * 1-5'
+  workflow_dispatch: {}
+
+jobs:
+  scan-and-report:
+    runs-on: ubuntu-latest
+    # bse_full_universe.csv covers ~5,000+ BSE equities (vs the original
+    # ~1,000-stock plan), plus OpenCV pattern detection on top — this can
+    # run considerably longer than earlier versions of this workflow.
+    # Explicit cap so a stuck run doesn't silently burn Actions minutes.
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install yfinance pandas openpyxl numpy requests scikit-learn
+          pip install opencv-python-headless scipy
+
+      # Each scanner writes its own dated sheet into the SAME trading_toolkit.xlsx.
+      # They run sequentially in one job so the file changes carry forward from
+      # one step to the next — running them as separate parallel workflows would
+      # each start from a fresh checkout and never see each other's sheets.
+
+      - name: Run NSE main scan (market_scanner.py)
+        run: python market_scanner.py trading_toolkit.xlsx nifty500.csv niftysmallcap250.csv bse_smallcap250_clean.csv
+
+      - name: Run BSE gainer scan
+        run: python bse_gainer_scanner.py trading_toolkit.xlsx bse_smallcap250_clean.csv
+
+      - name: Run BSE 1000 scan (chart patterns + Ultra Top Picks)
+        run: python bse1000_scanner.py trading_toolkit.xlsx bse_full_universe.csv
+
+      - name: Send consolidated email report
+        if: always()   # still try to email whatever succeeded, even if one scanner above failed
+        env:
+          GMAIL_SENDER: ${{ secrets.GMAIL_SENDER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          REPORT_RECIPIENT: lightsoul.n@gmail.com
+        run: python send_scan_report.py trading_toolkit.xlsx
+
+      - name: Upload updated workbook as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trading_toolkit
+          path: trading_toolkit.xlsx
+          retention-days: 14

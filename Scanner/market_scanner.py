@@ -33,10 +33,12 @@ Usage:
 import sys
 import time
 import pickle
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 import pandas as pd
 import numpy as np
+import requests
 import yfinance as yf
 from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -62,12 +64,82 @@ NIFTY_TICKER = "^NSEI"
 TOP_N_DEEPDIVE = 25   # how many top-ranked stocks get the full deep-dive treatment
 
 # Parallel fetch settings. Yahoo Finance is the bottleneck (one network round-trip
-# per symbol), not the CSV/merge step - this is what actually speeds up a 250-1000
-# stock scan. Higher = faster, but too high risks Yahoo rate-limiting/blocking you
-# mid-scan, which then shows up as a wave of "SKIPPED (no data)" you wouldn't
-# otherwise get. Start at 15; if you see failures climb, drop it, don't raise it.
-MAX_WORKERS = 15
+# per symbol), not the CSV/merge step - this is what actually speeds up a 250-1000+
+# stock scan. Real-world evidence (a 4704-stock run) showed Yahoo blocking the
+# client after only ~380 requests at 15 workers - so 15 is NOT a safe default for
+# large universes. Lowered to 8. The circuit breaker below is the real safety net;
+# this number just controls how fast you *approach* the limit, not whether you
+# recover from hitting it.
+MAX_WORKERS = 8
 FETCH_RETRIES = 1   # one retry on transient failures (timeouts, momentary rate limits)
+
+# A shared session with a real browser User-Agent. Yahoo's anti-bot layer is more
+# likely to flag the default python-requests/urllib user agent than a normal
+# browser string - this doesn't guarantee avoiding rate limits, but it's a
+# legitimate, low-risk reduction in how "botlike" the traffic looks.
+_SHARED_SESSION = requests.Session()
+_SHARED_SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+})
+
+
+class _RateLimitGuard:
+    """Shared circuit breaker across all worker threads.
+
+    Yahoo Finance gives no clean 'you are being rate-limited' signal through
+    yfinance - once it starts throttling you, perfectly valid, liquid symbols
+    (Shriram Finance, PCBL, etc.) just silently come back empty, identical to
+    a real delisted stock. The tell isn't any single failure - it's a WALL of
+    consecutive failures right after a stretch of real successes, which is
+    exactly what a burst of parallel workers can trigger partway through a
+    large scan (this is what the 4704-stock run showed: clean through ~375,
+    then 100% failures from ~400 onward).
+
+    This tracks consecutive failures across all threads. Once that streak
+    crosses a threshold, every worker pauses (checked before their next
+    request) for a cooldown period, then resumes automatically. If it keeps
+    happening, the cooldown escalates (doubles, capped) rather than retrying
+    at the same pace that got it blocked in the first place.
+    """
+
+    def __init__(self, failure_threshold=12, cooldown_seconds=90, max_cooldown=900):
+        self._lock = threading.Lock()
+        self._consecutive_failures = 0
+        self._paused_until = 0.0
+        self._failure_threshold = failure_threshold
+        self._base_cooldown = cooldown_seconds
+        self._current_cooldown = cooldown_seconds
+        self._max_cooldown = max_cooldown
+
+    def wait_if_paused(self):
+        while True:
+            with self._lock:
+                remaining = self._paused_until - time.time()
+            if remaining <= 0:
+                return
+            time.sleep(min(remaining, 5))
+
+    def record_success(self):
+        with self._lock:
+            self._consecutive_failures = 0
+            self._current_cooldown = self._base_cooldown  # things are working again - reset the backoff
+
+    def record_failure(self):
+        with self._lock:
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self._failure_threshold and time.time() >= self._paused_until:
+                cooldown = self._current_cooldown
+                print(f"\n[rate-limit guard] {self._consecutive_failures} consecutive fetch failures - "
+                      f"this almost always means Yahoo Finance is throttling this connection, not that "
+                      f"this many stocks in a row are genuinely delisted. Pausing ALL workers for "
+                      f"{cooldown:.0f}s to cool down, then resuming automatically...\n")
+                self._paused_until = time.time() + cooldown
+                self._consecutive_failures = 0
+                self._current_cooldown = min(cooldown * 2, self._max_cooldown)  # escalate if it recurs
+
+
+_rate_guard = _RateLimitGuard()
 
 HEADERS = ["Symbol", "Name", "Sector", "Cap Segment", "Close", "% Chg", "Volume",
            "Vol Ratio (vs 3d avg)", "Mkt Cap (Cr)",
@@ -155,18 +227,24 @@ def fetch_history(nse_symbol, period="1y"):
     """Tries the NSE listing (.NS) first since it's usually more liquid/reliable
     on Yahoo Finance; falls back to the BSE listing (.BO) if the stock isn't on
     NSE at all (common for smaller BSE-only smallcaps). Retries once per
-    exchange on transient failures (common when running many threads at once).
+    exchange on transient failures. Checks/reports into the shared rate-limit
+    guard so a burst of throttling gets detected and cooled down instead of
+    silently eating thousands of otherwise-valid stocks.
     Returns (df, ticker_str) or (None, None)."""
     for suffix in (".NS", ".BO"):
         ticker_str = nse_symbol.strip() + suffix
         for attempt in range(FETCH_RETRIES + 1):
+            _rate_guard.wait_if_paused()
             try:
-                tk = yf.Ticker(ticker_str)
+                tk = yf.Ticker(ticker_str, session=_SHARED_SESSION)
                 df = tk.history(period=period, interval="1d", auto_adjust=True)
                 if not df.empty and len(df) >= 60:
+                    _rate_guard.record_success()
                     return df, ticker_str, tk
+                _rate_guard.record_failure()
                 break  # empty result isn't transient - move to next suffix, don't retry
             except Exception:
+                _rate_guard.record_failure()
                 if attempt < FETCH_RETRIES:
                     time.sleep(0.5 * (attempt + 1))
                     continue
