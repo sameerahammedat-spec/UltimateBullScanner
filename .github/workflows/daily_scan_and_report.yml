@@ -2,17 +2,30 @@ name: Daily Scan and Report
 
 on:
   schedule:
-    # 10:15 UTC = 3:45 PM IST, Monday-Friday (just after market close)
-    - cron: '15 10 * * 1-5'
+    # 11:02 UTC = 4:32 PM IST, Monday-Friday.
+    # Why this time, not 3:45 PM: NSE closes 3:30 PM IST, and Yahoo's backend
+    # doesn't always finish finalizing every stock's end-of-day bar right away -
+    # running too soon after close risks incomplete/NaN last-day data (the exact
+    # bug market_scanner.py's dropna fix now handles, but less of it happening
+    # in the first place is better). An hour's buffer gives Yahoo time to settle.
+    # Why not later: US markets open 7:00 PM IST (9:30 AM ET) - Yahoo's global
+    # traffic rises once US trading is live, so finishing before then avoids
+    # competing with that load. 4:00-6:30 PM IST is a comparatively quiet window.
+    # Why :02 and not :00/:15/:30/:45: scheduled jobs across ALL of GitHub
+    # Actions cluster at round times, which can delay your run during peak load -
+    # an off-round minute avoids that queue.
+    - cron: '2 11 * * 1-5'
   workflow_dispatch: {}
 
 jobs:
   scan-and-report:
     runs-on: ubuntu-latest
-    # bse_full_universe.csv covers ~5,000+ BSE equities (vs the original
-    # ~1,000-stock plan), plus OpenCV pattern detection on top — this can
-    # run considerably longer than earlier versions of this workflow.
-    # Explicit cap so a stuck run doesn't silently burn Actions minutes.
+    # This daily run intentionally uses bse1000_clean.csv (~1,000 curated BSE
+    # 1000 index stocks), NOT bse_full_universe.csv (~4,700+ stocks) - the full
+    # universe is much slower and hits Yahoo's rate limiter far more often; it's
+    # meant for occasional manual deep-dives, not this daily schedule. See
+    # COMMAND_REFERENCE.txt for the full routine-vs-occasional breakdown.
+    # 90 min covers normal runs plus a couple of rate-limit-guard cooldowns.
     timeout-minutes: 90
     defaults:
       run:
@@ -25,6 +38,8 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: Scanner/requirements.txt
 
       - name: Install dependencies
         run: |

@@ -32,10 +32,12 @@ Usage:
 
 import sys
 import time
+import json
+import random
 import pickle
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date
+from datetime import date, datetime, timedelta
 import pandas as pd
 import numpy as np
 import requests
@@ -62,6 +64,14 @@ BORDER = Border(left=thin, right=thin, top=thin, bottom=thin)
 MIN_VOLUME = 50000
 NIFTY_TICKER = "^NSEI"
 TOP_N_DEEPDIVE = 25   # how many top-ranked stocks get the full deep-dive treatment
+
+# market_scanner.py, bse_gainer_scanner.py, and bse1000_scanner.py all import
+# get_nifty_returns() and each used to fetch it independently - 3x redundant
+# Yahoo requests for identical data, every single run. Caching it to a file
+# means only the first caller in a given run (or within this window) actually
+# hits Yahoo; the rest read the cache instantly.
+NIFTY_CACHE_FILE = "nifty_returns_cache.json"
+NIFTY_CACHE_MAX_AGE_HOURS = 6
 
 # Parallel fetch settings. Yahoo Finance is the bottleneck (one network round-trip
 # per symbol), not the CSV/merge step - this is what actually speeds up a 250-1000+
@@ -253,12 +263,55 @@ def fetch_history(nse_symbol, period="1y"):
 
 
 def get_nifty_returns():
-    tk = yf.Ticker(NIFTY_TICKER)
-    df = tk.history(period="1y", interval="1d", auto_adjust=True)
-    close = df["Close"]
-    ret_1m = (close.iloc[-1] / close.iloc[-22] - 1) * 100 if len(close) > 22 else None
-    ret_3m = (close.iloc[-1] / close.iloc[-63] - 1) * 100 if len(close) > 63 else None
-    return ret_1m, ret_3m
+    """Cached + guarded Nifty 50 benchmark fetch. Uses the SAME _SHARED_SESSION
+    and _rate_guard circuit breaker as fetch_history() above - a failed
+    benchmark fetch now counts toward the shared consecutive-failure count
+    (and waits if the guard is already cooling down), instead of being an
+    unprotected blind spot that crashes the whole scan on the first 429.
+
+    Also cached to disk: market_scanner.py, bse_gainer_scanner.py, and
+    bse1000_scanner.py all call this exact function for identical data - the
+    cache means only the first call in a run (within NIFTY_CACHE_MAX_AGE_HOURS)
+    touches Yahoo at all."""
+    try:
+        with open(NIFTY_CACHE_FILE, "r") as f:
+            cached = json.load(f)
+        cached_time = datetime.fromisoformat(cached["fetched_at"])
+        if datetime.now() - cached_time < timedelta(hours=NIFTY_CACHE_MAX_AGE_HOURS):
+            print(f"Nifty benchmark: using cache from {cached['fetched_at']} "
+                  f"(1M={cached['ret_1m']}, 3M={cached['ret_3m']})")
+            return cached["ret_1m"], cached["ret_3m"]
+    except (FileNotFoundError, KeyError, ValueError):
+        pass  # no usable cache yet - fetch fresh below
+
+    # A bit more patient than the per-stock retry count - losing the whole
+    # benchmark (which every downstream RS calculation depends on) is far
+    # costlier than losing one stock out of hundreds.
+    max_attempts = FETCH_RETRIES + 3
+    for attempt in range(1, max_attempts + 1):
+        _rate_guard.wait_if_paused()
+        try:
+            tk = yf.Ticker(NIFTY_TICKER, session=_SHARED_SESSION)
+            df = tk.history(period="1y", interval="1d", auto_adjust=True)
+            close = df["Close"]
+            ret_1m = (close.iloc[-1] / close.iloc[-22] - 1) * 100 if len(close) > 22 else None
+            ret_3m = (close.iloc[-1] / close.iloc[-63] - 1) * 100 if len(close) > 63 else None
+            _rate_guard.record_success()
+
+            with open(NIFTY_CACHE_FILE, "w") as f:
+                json.dump({"fetched_at": datetime.now().isoformat(),
+                           "ret_1m": ret_1m, "ret_3m": ret_3m}, f)
+            return ret_1m, ret_3m
+
+        except Exception as e:
+            _rate_guard.record_failure()
+            if attempt == max_attempts:
+                print(f"[!] Nifty benchmark fetch failed after {max_attempts} attempts: {e}")
+                raise
+            wait = (2 ** attempt) + random.uniform(0, 2)
+            print(f"Nifty benchmark fetch failed ({e}), retrying in {wait:.1f}s "
+                  f"(attempt {attempt}/{max_attempts})...")
+            time.sleep(wait)
 
 
 def analyze_symbol(nse_symbol, nifty_1m, nifty_3m, return_series=False):
@@ -268,6 +321,17 @@ def analyze_symbol(nse_symbol, nifty_1m, nifty_3m, return_series=False):
 
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
+
+    # Yahoo sometimes appends an incomplete bar for the most recent trading day
+    # (NaN Close) before its backend has fully finalized end-of-day data - this
+    # is common when scanning shortly after market close, and it's what caused
+    # every downstream calculation assuming iloc[-1] is valid to crash with
+    # "unsupported operand type(s) for /: NoneType and float". Dropping any
+    # NaN-Close rows here restores that assumption for the rest of the function,
+    # falling back to the last genuinely complete trading day instead.
+    df = df[df["Close"].notna()]
+    if df.empty or len(df) < 60:
+        return None
 
     close, volume = df["Close"], df["Volume"]
     last_close = to_scalar(close.iloc[-1])
@@ -301,8 +365,12 @@ def analyze_symbol(nse_symbol, nifty_1m, nifty_3m, return_series=False):
     high_52w = to_scalar(close.rolling(252).max().iloc[-1]) if len(close) >= 60 else to_scalar(close.max())
     down_from_high = ((high_52w - last_close) / high_52w * 100) if (high_52w and last_close) else None
 
-    stock_1m = (last_close / to_scalar(close.iloc[-22]) - 1) * 100 if len(close) > 22 else None
-    stock_3m = (last_close / to_scalar(close.iloc[-63]) - 1) * 100 if len(close) > 63 else None
+    stock_1m_denom = to_scalar(close.iloc[-22]) if len(close) > 22 else None
+    stock_3m_denom = to_scalar(close.iloc[-63]) if len(close) > 63 else None
+    stock_1m = ((last_close / stock_1m_denom - 1) * 100
+                if (last_close is not None and stock_1m_denom) else None)
+    stock_3m = ((last_close / stock_3m_denom - 1) * 100
+                if (last_close is not None and stock_3m_denom) else None)
     rs_1m = (stock_1m - nifty_1m) if (stock_1m is not None and nifty_1m is not None) else None
     rs_3m = (stock_3m - nifty_3m) if (stock_3m is not None and nifty_3m is not None) else None
 
