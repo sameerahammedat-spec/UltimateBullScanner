@@ -47,8 +47,6 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.formatting.rule import CellIsRule
 from openpyxl.utils import get_column_letter
 
-
-
 FONT = "Arial"
 BLACK = Font(name=FONT, size=10)
 BLACK_B = Font(name=FONT, size=10, bold=True)
@@ -683,92 +681,8 @@ def run_scan(xlsx_path, universe_paths, verbose=True):
     return full_scan, early_momentum, deep_dive
 
 
-def _build_explosive_candidates(rows, nifty_1m, nifty_3m, market_regime,
-                                exchange, ticker_suffix, scanner_name, limit=5):
-    from explosive_config import DEFAULT_CONFIG
-    from explosive_engine import analyze_symbol_explosive
-
-    """Run the expensive multi-year explosive analysis only on the top shortlisted rows."""
-    explosive_candidates = []
-    rejected = []
-
-    for d in rows[:limit]:
-        symbol = str(d.get("symbol", "")).strip()
-        if not symbol:
-            continue
-
-        ticker = symbol if symbol.endswith(ticker_suffix) else symbol + ticker_suffix
-        try:
-            hist = yf.Ticker(ticker, session=_SHARED_SESSION).history(
-                period=f"{DEFAULT_CONFIG.calibration_years}y",
-                interval="1d",
-                auto_adjust=True,
-            )
-        except Exception as exc:
-            print(f"[Explosive] {symbol}: history fetch failed ({exc})")
-            continue
-
-        if hist is None or hist.empty:
-            print(f"[Explosive] {symbol}: no multi-year history")
-            continue
-
-        if isinstance(hist.columns, pd.MultiIndex):
-            hist.columns = hist.columns.get_level_values(0)
-        required = ["Open", "High", "Low", "Close", "Volume"]
-        if any(col not in hist.columns for col in required):
-            print(f"[Explosive] {symbol}: missing required OHLCV columns")
-            continue
-        hist = hist.dropna(subset=["High", "Low", "Close", "Volume"])
-        if hist.empty:
-            continue
-
-        try:
-            candidate = analyze_symbol_explosive(
-                symbol=symbol,
-                name=d.get("name", symbol),
-                exchange=exchange,
-                scanner_sources=[scanner_name],
-                sector=d.get("sector", ""),
-                df=hist,
-                nifty_1m=nifty_1m,
-                nifty_3m=nifty_3m,
-                market_regime=market_regime,
-                config=DEFAULT_CONFIG,
-                analysis_date=date.today(),
-            )
-        except Exception as exc:
-            print(f"[Explosive] {symbol}: analysis failed ({exc})")
-            continue
-
-        (rejected if candidate.rejected else explosive_candidates).append(candidate)
-
-    explosive_candidates.sort(key=lambda c: c.final_score, reverse=True)
-    rejected.sort(key=lambda c: c.final_score, reverse=True)
-    return explosive_candidates, rejected
-
 def main(xlsx_path, universe_paths):
-
-    from explosive_market_regime import classify_regime
     full_scan, early_momentum, deep_dive = run_scan(xlsx_path, universe_paths)
-
-    # get_nifty_returns() is cached, so this normally does not create another benchmark request
-    nifty_1m, nifty_3m = get_nifty_returns()
-    nifty_hist = yf.Ticker("^NSEI", session=_SHARED_SESSION).history(
-        period="1y", interval="1d", auto_adjust=True
-    )
-    above_50dma_flags = [d.get("above_50dma", False) for d in full_scan]
-    regime = classify_regime(nifty_hist["Close"], above_50dma_flags)
-
-    explosive_candidates, explosive_rejected = _build_explosive_candidates(
-        rows=full_scan,
-        nifty_1m=nifty_1m,
-        nifty_3m=nifty_3m,
-        market_regime=regime,
-        exchange="NSE",
-        ticker_suffix=".NS",
-        scanner_name="NSE 500 Scanner",
-        limit=60,
-    )
 
     today = date.today()
     sheet_name = f"Scan_{today.strftime('%d%b%y')}"
@@ -781,8 +695,7 @@ def main(xlsx_path, universe_paths):
     print(f"Backup saved to {backup_path} (safe even if the Excel write below fails)\n")
 
     try:
-        write_to_workbook(xlsx_path, sheet_name, today, full_scan, early_momentum, deep_dive,
-                          explosive_candidates, explosive_rejected, regime)
+        write_to_workbook(xlsx_path, sheet_name, today, full_scan, early_momentum, deep_dive)
     except PermissionError:
         print(f"\n[!] Could not save {xlsx_path} — it's likely still open in Excel/LibreOffice.")
         print("    1. Close the Excel file completely.")
@@ -794,9 +707,7 @@ def main(xlsx_path, universe_paths):
     print("P/E, ROE, Debt/Equity, QoQ Growth are best-effort from Yahoo Finance — cross-check on Screener.in.")
 
 
-def write_to_workbook(xlsx_path, sheet_name, today, full_scan, early_momentum, deep_dive,
-                          explosive_candidates, explosive_rejected, regime):
-    from explosive_report import write_explosive_section
+def write_to_workbook(xlsx_path, sheet_name, today, full_scan, early_momentum, deep_dive):
     wb = load_workbook(xlsx_path)
     if sheet_name in wb.sheetnames:
         del wb[sheet_name]
@@ -809,17 +720,8 @@ def write_to_workbook(xlsx_path, sheet_name, today, full_scan, early_momentum, d
     next_row = write_table(ws, 3, full_scan, title=f"FULL SCAN — {len(full_scan)} stocks passed liquidity filter, ranked by score")
     next_row = write_table(ws, next_row, early_momentum,
                 title=f"EARLY MOMENTUM WATCHLIST (RSI 40-50) — {len(early_momentum)} stocks turning up, not yet extended")
-    next_row = write_deepdive_table(ws, next_row, deep_dive,
+    write_deepdive_table(ws, next_row, deep_dive,
                 title=f"TOP CANDIDATES — DEEP DIVE (trend, entry/stop/targets) — top {len(deep_dive)}")
-    write_explosive_section(
-        ws, next_row, explosive_candidates, explosive_rejected, [],
-        {
-            "Qualifying setups": len(explosive_candidates),
-            "Rejected setups": len(explosive_rejected),
-            "Market regime": str(regime),
-        },
-        today.strftime("%d %b %Y"),
-    )
 
     for i in range(1, len(HEADERS) + 1):
         ws.column_dimensions[get_column_letter(i)].width = 13

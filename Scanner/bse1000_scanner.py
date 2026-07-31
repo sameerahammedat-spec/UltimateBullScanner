@@ -23,6 +23,8 @@ BSE index export into a clean Symbol-based CSV - see GETTING_BSE_SCRIP_MASTER.md
 
 import sys
 import time
+import pandas as pd
+import yfinance as yf
 from datetime import date
 
 from openpyxl import load_workbook
@@ -32,8 +34,14 @@ from openpyxl.utils import get_column_letter
 from market_scanner import (
     FONT, BLACK, HDR_FONT, HDR_FILL, SEC_FILL, SEC_FONT, ALT_FILL, BORDER,
     load_universe, analyze_symbol, analyze_universe_parallel, get_nifty_returns, score_row, verdict, TOP_N_DEEPDIVE,
+    _SHARED_SESSION,
 )
 from chart_patterns import detect_pattern, BULLISH_PATTERNS
+
+from explosive_config import DEFAULT_CONFIG
+from explosive_engine import analyze_symbol_explosive
+from explosive_market_regime import classify_regime
+from explosive_report import write_explosive_section
 
 # --- Ultra Top Picks thresholds (tune these to taste) ----------------------
 ULTRA_MIN_TREND_QUALITY = 15.0     # ADX x R^2 - both strong AND clean
@@ -159,8 +167,87 @@ def ultra_row(d):
             num(d.get("target1")), num(d.get("target2"))]
 
 
+def _build_explosive_candidates(rows, nifty_1m, nifty_3m, market_regime,
+                                exchange, ticker_suffix, scanner_name, limit=60):
+    """Run the expensive multi-year explosive analysis only on the top shortlisted rows."""
+    explosive_candidates = []
+    rejected = []
+
+    for d in rows[:limit]:
+        symbol = str(d.get("symbol", "")).strip()
+        if not symbol:
+            continue
+
+        ticker = symbol if symbol.endswith(ticker_suffix) else symbol + ticker_suffix
+        try:
+            hist = yf.Ticker(ticker, session=_SHARED_SESSION).history(
+                period=f"{DEFAULT_CONFIG.calibration_years}y",
+                interval="1d",
+                auto_adjust=True,
+            )
+        except Exception as exc:
+            print(f"[Explosive] {symbol}: history fetch failed ({exc})")
+            continue
+
+        if hist is None or hist.empty:
+            print(f"[Explosive] {symbol}: no multi-year history")
+            continue
+
+        if isinstance(hist.columns, pd.MultiIndex):
+            hist.columns = hist.columns.get_level_values(0)
+        required = ["Open", "High", "Low", "Close", "Volume"]
+        if any(col not in hist.columns for col in required):
+            print(f"[Explosive] {symbol}: missing required OHLCV columns")
+            continue
+        hist = hist.dropna(subset=["High", "Low", "Close", "Volume"])
+        if hist.empty:
+            continue
+
+        try:
+            candidate = analyze_symbol_explosive(
+                symbol=symbol,
+                name=d.get("name", symbol),
+                exchange=exchange,
+                scanner_sources=[scanner_name],
+                sector=d.get("sector", ""),
+                df=hist,
+                nifty_1m=nifty_1m,
+                nifty_3m=nifty_3m,
+                market_regime=market_regime,
+                config=DEFAULT_CONFIG,
+                analysis_date=date.today(),
+            )
+        except Exception as exc:
+            print(f"[Explosive] {symbol}: analysis failed ({exc})")
+            continue
+
+        (rejected if candidate.rejected else explosive_candidates).append(candidate)
+
+    explosive_candidates.sort(key=lambda c: c.final_score, reverse=True)
+    rejected.sort(key=lambda c: c.final_score, reverse=True)
+    return explosive_candidates, rejected
+
 def main(xlsx_path, universe_paths):
     full_scan, deep_dive, ultra = run_bse1000_scan(universe_paths)
+
+    nifty_1m, nifty_3m = get_nifty_returns()
+    benchmark_hist = yf.Ticker("^BSESN", session=_SHARED_SESSION).history(
+        period="1y", interval="1d", auto_adjust=True
+    )
+    above_50dma_flags = [d.get("above_50dma", False) for d in full_scan]
+    regime = classify_regime(benchmark_hist["Close"], above_50dma_flags)
+
+    explosive_candidates, explosive_rejected = _build_explosive_candidates(
+        rows=full_scan,
+        nifty_1m=nifty_1m,
+        nifty_3m=nifty_3m,
+        market_regime=regime,
+        exchange="BSE",
+        ticker_suffix=".BO",
+        scanner_name="BSE 1000 Scanner",
+        limit=60,
+    )
+
     today = date.today()
     sheet_name = f"BSE1000_{today.strftime('%d%b%y')}"
 
@@ -177,9 +264,18 @@ def main(xlsx_path, universe_paths):
                         title=f"FULL SCAN — {len(full_scan)} liquid stocks scanned")
     r = _write_section(ws, r, DEEPDIVE_HEADERS, deep_dive, deepdive_row,
                         title=f"DEEP DIVE — top {len(deep_dive)} by score")
-    _write_section(ws, r, ULTRA_HEADERS, ultra, ultra_row,
+    r = _write_section(ws, r, ULTRA_HEADERS, ultra, ultra_row,
                    title=f"ULTRA TOP PICKS — {len(ultra)} (pattern-confirmed, spike-filtered, "
                          f"trend quality >= {ULTRA_MIN_TREND_QUALITY})")
+    write_explosive_section(
+        ws, r, explosive_candidates, explosive_rejected, [],
+        {
+            "Qualifying setups": len(explosive_candidates),
+            "Rejected setups": len(explosive_rejected),
+            "Market regime": str(regime),
+        },
+        today.strftime("%d %b %Y"),
+    )
 
     for i in range(1, len(FULL_HEADERS) + 1):
         ws.column_dimensions[get_column_letter(i)].width = 15
