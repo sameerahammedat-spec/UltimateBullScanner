@@ -3,12 +3,15 @@ name: Daily Scan and Report
 on:
   schedule:
     # 11:02 UTC = 4:32 PM IST, Monday-Friday.
-    # This gives Yahoo Finance time to finalize Indian-market daily candles.
     - cron: '2 11 * * 1-5'
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: daily-stock-scan
+  cancel-in-progress: true
 
 env:
   TZ: Asia/Kolkata
@@ -18,8 +21,6 @@ env:
 jobs:
   scan-and-report:
     runs-on: ubuntu-latest
-    # NSE + BSE 1000 + BSE gainers + Group A/B, including the integrated
-    # Explosive Engine, can take considerably longer than the old 3-scanner job.
     timeout-minutes: 300
 
     defaults:
@@ -42,7 +43,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
-          python -m pip install scipy opencv-python-headless scikit-learn
+          python -m pip install scipy opencv-python-headless scikit-learn pytest
 
       - name: Create a fresh workbook for today
         id: prepare_workbook
@@ -53,8 +54,6 @@ jobs:
           mkdir -p daily_reports
           cp trading_toolkit.xlsx "$REPORT_FILE"
 
-          # Keep reusable template sheets, but remove every old dated scanner
-          # sheet so this workbook contains only today's generated scan sheets.
           python - "$REPORT_FILE" <<'PY'
           import sys
           from pathlib import Path
@@ -89,9 +88,40 @@ jobs:
           echo "report_file=$REPORT_FILE" >> "$GITHUB_OUTPUT"
           echo "report_name=trading_toolkit_${REPORT_DATE}" >> "$GITHUB_OUTPUT"
 
-      # Each scanner writes to the SAME fresh daily workbook. Explosive Engine
-      # execution is already integrated inside market_scanner.py,
-      # bse_gainer_scanner.py, bse1000_scanner.py and group_ab_scanner.py.
+      # This cache is useful for manual re-runs on the same day. The scanner
+      # itself rejects cache data older than its configured freshness window.
+      - name: Restore Group A/B price cache
+        uses: actions/cache@v4
+        with:
+          path: Scanner/group_ab_price_cache.pkl
+          key: group-ab-price-${{ runner.os }}-${{ steps.prepare_workbook.outputs.report_date }}-${{ hashFiles('Scanner/Group_A.csv', 'Scanner/Group_B.csv', 'Scanner/group_ab_scanner.py') }}
+          restore-keys: |
+            group-ab-price-${{ runner.os }}-${{ steps.prepare_workbook.outputs.report_date }}-
+
+      - name: Validate Group A/B scanner and universe
+        run: |
+          python -m py_compile group_ab_scanner.py
+          python - <<'PY'
+          from group_ab_scanner import load_group_ab_universe
+
+          records = load_group_ab_universe("Group_A.csv", "Group_B.csv")
+          if len(records) < 1000:
+              raise SystemExit(f"Unexpectedly small Group A/B universe: {len(records)}")
+
+          invalid = [
+              record for record in records
+              if record.security_id.upper().startswith("INE")
+              or record.yahoo_ticker.upper().startswith("INE")
+          ]
+          if invalid:
+              sample = [(r.symbol, r.security_id, r.yahoo_ticker) for r in invalid[:5]]
+              raise SystemExit(f"ISIN values are still being used as Yahoo tickers: {sample}")
+
+          print(f"Validated {len(records)} unique Group A/B securities")
+          print("Sample ticker resolution:")
+          for record in records[:5]:
+              print(f"  {record.symbol} | {record.name} | {record.yahoo_ticker}")
+          PY
 
       - name: Run NSE main scanner and Explosive Engine
         continue-on-error: true
@@ -119,16 +149,24 @@ jobs:
           python bse1000_scanner.py "$REPORT_FILE" \
             bse1000_clean.csv
 
-      - name: Run BSE Group A/B scanner and Explosive Engine
+      - name: Run full BSE Group A/B scanner and Explosive Engine
         continue-on-error: true
         env:
           REPORT_FILE: ${{ steps.prepare_workbook.outputs.report_file }}
+          GROUP_AB_BATCH_SIZE: '80'
+          GROUP_AB_WORKERS: '8'
+          GROUP_AB_EXPLOSIVE_LIMIT: '30'
+          GROUP_AB_MAX_SYMBOLS: '0'
+          GROUP_AB_CACHE_HOURS: '10'
         run: |
           python group_ab_scanner.py "$REPORT_FILE" \
             Group_A.csv \
-            Group_B.csv
+            Group_B.csv \
+            --batch-size 80 \
+            --workers 8 \
+            --explosive-limit 30
 
-      - name: Show final workbook sheets
+      - name: Verify final workbook sheets
         if: always()
         env:
           REPORT_FILE: ${{ steps.prepare_workbook.outputs.report_file }}
@@ -147,6 +185,14 @@ jobs:
           print("Sheets:")
           for sheet_name in workbook.sheetnames:
               print(f"  - {sheet_name}")
+
+          required_prefixes = ("Scan_", "BSEGain_", "BSE1000_", "GroupAB_")
+          missing = [
+              prefix for prefix in required_prefixes
+              if not any(name.startswith(prefix) for name in workbook.sheetnames)
+          ]
+          if missing:
+              raise SystemExit(f"Missing expected scanner sheet prefix(es): {missing}")
           PY
 
       - name: Send consolidated email report
