@@ -3,75 +3,166 @@ name: Daily Scan and Report
 on:
   schedule:
     # 11:02 UTC = 4:32 PM IST, Monday-Friday.
-    # Why this time, not 3:45 PM: NSE closes 3:30 PM IST, and Yahoo's backend
-    # doesn't always finish finalizing every stock's end-of-day bar right away -
-    # running too soon after close risks incomplete/NaN last-day data (the exact
-    # bug market_scanner.py's dropna fix now handles, but less of it happening
-    # in the first place is better). An hour's buffer gives Yahoo time to settle.
-    # Why not later: US markets open 7:00 PM IST (9:30 AM ET) - Yahoo's global
-    # traffic rises once US trading is live, so finishing before then avoids
-    # competing with that load. 4:00-6:30 PM IST is a comparatively quiet window.
-    # Why :02 and not :00/:15/:30/:45: scheduled jobs across ALL of GitHub
-    # Actions cluster at round times, which can delay your run during peak load -
-    # an off-round minute avoids that queue.
+    # This gives Yahoo Finance time to finalize Indian-market daily candles.
     - cron: '2 11 * * 1-5'
-  workflow_dispatch: {}
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Kolkata
+  PYTHONUNBUFFERED: '1'
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
 
 jobs:
   scan-and-report:
     runs-on: ubuntu-latest
-    # This daily run intentionally uses bse1000_clean.csv (~1,000 curated BSE
-    # 1000 index stocks), NOT bse_full_universe.csv (~4,700+ stocks) - the full
-    # universe is much slower and hits Yahoo's rate limiter far more often; it's
-    # meant for occasional manual deep-dives, not this daily schedule. See
-    # COMMAND_REFERENCE.txt for the full routine-vs-occasional breakdown.
-    # 90 min covers normal runs plus a couple of rate-limit-guard cooldowns.
-    timeout-minutes: 90
+    # NSE + BSE 1000 + BSE gainers + Group A/B, including the integrated
+    # Explosive Engine, can take considerably longer than the old 3-scanner job.
+    timeout-minutes: 300
+
     defaults:
       run:
+        shell: bash
         working-directory: Scanner
+
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          cache: 'pip'
+          cache: pip
           cache-dependency-path: Scanner/requirements.txt
 
       - name: Install dependencies
         run: |
-          pip install yfinance pandas openpyxl numpy requests scikit-learn
-          pip install opencv-python-headless scipy
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install scipy opencv-python-headless scikit-learn
 
-      # Each scanner writes its own dated sheet into the SAME trading_toolkit.xlsx.
-      # They run sequentially in one job so the file changes carry forward from
-      # one step to the next — running them as separate parallel workflows would
-      # each start from a fresh checkout and never see each other's sheets.
+      - name: Create a fresh workbook for today
+        id: prepare_workbook
+        run: |
+          REPORT_DATE="$(date +'%Y-%m-%d')"
+          REPORT_FILE="daily_reports/trading_toolkit_${REPORT_DATE}.xlsx"
 
-      - name: Run NSE main scan (market_scanner.py)
-        run: python market_scanner.py trading_toolkit.xlsx nifty500.csv niftysmallcap250.csv bse_smallcap250_clean.csv
+          mkdir -p daily_reports
+          cp trading_toolkit.xlsx "$REPORT_FILE"
 
-      - name: Run BSE gainer scan
-        run: python bse_gainer_scanner.py trading_toolkit.xlsx bse_smallcap250_clean.csv
+          # Keep reusable template sheets, but remove every old dated scanner
+          # sheet so this workbook contains only today's generated scan sheets.
+          python - "$REPORT_FILE" <<'PY'
+          import sys
+          from pathlib import Path
+          from openpyxl import load_workbook
 
-      - name: Run BSE 1000 scan (chart patterns + Ultra Top Picks)
-        run: python bse1000_scanner.py trading_toolkit.xlsx bse1000_clean.csv
+          report_path = Path(sys.argv[1])
+          dynamic_prefixes = (
+              "Scan_",
+              "BSEGain_",
+              "BSE1000_",
+              "GroupAB_",
+              "Explosive_",
+          )
+
+          workbook = load_workbook(report_path)
+          removed = []
+          for sheet_name in list(workbook.sheetnames):
+              if sheet_name.startswith(dynamic_prefixes):
+                  del workbook[sheet_name]
+                  removed.append(sheet_name)
+
+          if not workbook.sheetnames:
+              workbook.create_sheet("Daily Report")
+
+          workbook.save(report_path)
+          print(f"Fresh workbook created: {report_path}")
+          print(f"Removed old scanner sheets: {removed or 'none'}")
+          print(f"Retained template sheets: {workbook.sheetnames}")
+          PY
+
+          echo "report_date=$REPORT_DATE" >> "$GITHUB_OUTPUT"
+          echo "report_file=$REPORT_FILE" >> "$GITHUB_OUTPUT"
+          echo "report_name=trading_toolkit_${REPORT_DATE}" >> "$GITHUB_OUTPUT"
+
+      # Each scanner writes to the SAME fresh daily workbook. Explosive Engine
+      # execution is already integrated inside market_scanner.py,
+      # bse_gainer_scanner.py, bse1000_scanner.py and group_ab_scanner.py.
+
+      - name: Run NSE main scanner and Explosive Engine
+        continue-on-error: true
+        env:
+          REPORT_FILE: ${{ steps.prepare_workbook.outputs.report_file }}
+        run: |
+          python market_scanner.py "$REPORT_FILE" \
+            nifty500.csv \
+            niftysmallcap250.csv \
+            bse_smallcap250_clean.csv
+
+      - name: Run BSE gainer scanner and Explosive Engine
+        continue-on-error: true
+        env:
+          REPORT_FILE: ${{ steps.prepare_workbook.outputs.report_file }}
+        run: |
+          python bse_gainer_scanner.py "$REPORT_FILE" \
+            bse_smallcap250_clean.csv
+
+      - name: Run BSE 1000 scanner and Explosive Engine
+        continue-on-error: true
+        env:
+          REPORT_FILE: ${{ steps.prepare_workbook.outputs.report_file }}
+        run: |
+          python bse1000_scanner.py "$REPORT_FILE" \
+            bse1000_clean.csv
+
+      - name: Run BSE Group A/B scanner and Explosive Engine
+        continue-on-error: true
+        env:
+          REPORT_FILE: ${{ steps.prepare_workbook.outputs.report_file }}
+        run: |
+          python group_ab_scanner.py "$REPORT_FILE" \
+            Group_A.csv \
+            Group_B.csv
+
+      - name: Show final workbook sheets
+        if: always()
+        env:
+          REPORT_FILE: ${{ steps.prepare_workbook.outputs.report_file }}
+        run: |
+          python - "$REPORT_FILE" <<'PY'
+          import sys
+          from pathlib import Path
+          from openpyxl import load_workbook
+
+          report_path = Path(sys.argv[1])
+          if not report_path.exists():
+              raise SystemExit(f"Report workbook was not created: {report_path}")
+
+          workbook = load_workbook(report_path, read_only=True, data_only=False)
+          print(f"Final workbook: {report_path}")
+          print("Sheets:")
+          for sheet_name in workbook.sheetnames:
+              print(f"  - {sheet_name}")
+          PY
 
       - name: Send consolidated email report
-        if: always()   # still try to email whatever succeeded, even if one scanner above failed
+        if: always()
         env:
+          REPORT_FILE: ${{ steps.prepare_workbook.outputs.report_file }}
           GMAIL_SENDER: ${{ secrets.GMAIL_SENDER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           REPORT_RECIPIENT: sa2337308@gmail.com
-        run: python send_scan_report.py trading_toolkit.xlsx
+        run: python send_scan_report.py "$REPORT_FILE"
 
-      - name: Upload updated workbook as artifact
+      - name: Upload fresh daily workbook
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: trading_toolkit
-          path: Scanner/trading_toolkit.xlsx
-          retention-days: 14
+          name: ${{ steps.prepare_workbook.outputs.report_name }}
+          path: Scanner/${{ steps.prepare_workbook.outputs.report_file }}
+          if-no-files-found: error
+          retention-days: 30

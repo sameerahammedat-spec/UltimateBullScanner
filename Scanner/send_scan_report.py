@@ -1,7 +1,7 @@
 """
 Consolidated report — reads whatever today's scanner sheets already wrote
 into trading_toolkit.xlsx and emails one beautifully formatted HTML summary
-covering all of them (NSE main scan, BSE gainers, BSE 1000 + Ultra Picks).
+covering all of them (NSE main scan, BSE gainers, BSE 1000 + Ultra Picks, Group A/B + Explosive Engine).
 
 WHY GENERIC PARSING INSTEAD OF IMPORTING EACH SCANNER'S FUNCTIONS DIRECTLY:
 this script doesn't need to know market_scanner.py's internal schema (column
@@ -13,7 +13,7 @@ bse1000_scanner.py's write_table / write_gainers_table / _write_section
 functions - so this reads correctly regardless of exactly which columns
 any individual scanner decides to add or rename later.
 
-Run this AFTER all three scanners have already written into the same
+Run this AFTER all four scanners have already written into the same
 workbook (see the GitHub Actions workflow - it runs them in sequence first).
 
 Setup (once):
@@ -43,9 +43,10 @@ DEFAULT_RECIPIENT = "lightsoul.n@gmail.com"
 # Which sheet-name prefixes to look for today, in the order they should
 # appear in the email. Each scanner writes a sheet named "<prefix>_DDMonYY".
 SHEET_PREFIXES = [
-    ("BSE1000", "BSE 1000 Scan"),
-    ("BSEGain", "BSE Gainers (5%-20%)"),
     ("Scan", "NSE Main Scan"),
+    ("BSEGain", "BSE Gainers (5%-20%)"),
+    ("BSE1000", "BSE 1000 Scan"),
+    ("GroupAB", "BSE Group A/B Scan + Explosive Setups"),
 ]
 
 VERDICT_COLORS = {
