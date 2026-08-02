@@ -175,6 +175,22 @@ class EarlySwingCandidate:
     rejection_reason: str = ""
     usable_sessions: int = 0
     latest_data_date: str = ""
+    # Phase 2: pooled empirical calibration. These values are deliberately
+    # separate from the transparent rules score and remain NOT_AVAILABLE until
+    # a sufficiently large chronological sample exists.
+    empirical_probability_label: str = "NOT_AVAILABLE"
+    empirical_hit_rate_pct: Optional[float] = None
+    empirical_sample_size: int = 0
+    empirical_confidence: str = "INSUFFICIENT_SAMPLE"
+    empirical_ci_low_pct: Optional[float] = None
+    empirical_ci_high_pct: Optional[float] = None
+    calibration_key: str = ""
+    calibration_fallback_level: str = "NONE"
+    # Phase 3: persistent alert state. Alert generation is independent from the
+    # scanner score so a high-scoring stock can still be marked DO_NOT_CHASE.
+    alert_status: str = "NOT_EVALUATED"
+    alert_eligible: bool = False
+    alert_reason: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -195,3 +211,53 @@ class BacktestTrade:
     holding_sessions: int
     score: float
     setup_type: str
+    rally_age: int = 0
+    market_regime: str = "UNKNOWN"
+    score_band: str = "UNKNOWN"
+    entry_method: str = "NEXT_OPEN"
+    target_method: str = "FIXED_PERCENT"
+    holding_limit: int = 0
+    gross_return_pct: float = 0.0
+    total_cost_pct: float = 0.0
+    max_favourable_excursion_pct: float = 0.0
+    max_adverse_excursion_pct: float = 0.0
+    atr_pct: float = 0.0
+    liquidity_bucket: str = "UNKNOWN"
+
+
+@dataclass
+class CalibrationEstimate:
+    """Empirical Phase-2 estimate for one candidate or one calibration bucket."""
+
+    probability_label: str = "NOT_AVAILABLE"
+    hit_rate_pct: Optional[float] = None
+    sample_size: int = 0
+    confidence: str = "INSUFFICIENT_SAMPLE"
+    ci_low_pct: Optional[float] = None
+    ci_high_pct: Optional[float] = None
+    calibration_key: str = ""
+    fallback_level: str = "NONE"
+
+
+@dataclass
+class AlertEvent:
+    """One new or meaningfully changed Early Swing alert."""
+
+    setup_key: str
+    symbol: str
+    ticker: str
+    company_name: str
+    setup_date: str
+    setup_type: str
+    alert_status: str
+    rules_score: float
+    empirical_hit_rate_pct: Optional[float]
+    empirical_sample_size: int
+    current_price: Optional[float]
+    entry_low: Optional[float]
+    entry_high: Optional[float]
+    stop_loss: Optional[float]
+    target1: Optional[float]
+    target2: Optional[float]
+    reason: str
+    generated_at: str

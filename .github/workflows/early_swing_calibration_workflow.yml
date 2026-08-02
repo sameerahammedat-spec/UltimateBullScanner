@@ -1,0 +1,134 @@
+name: Early Swing Calibration
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_symbols:
+        description: 'Testing cap; 0 means full universe'
+        required: true
+        default: '300'
+      period:
+        description: 'Yahoo history period'
+        required: true
+        default: '5y'
+      minimum_sample:
+        description: 'Minimum sample for empirical hit rate'
+        required: true
+        default: '30'
+      full_grid:
+        description: 'Evaluate every entry/target/holding combination'
+        required: true
+        type: boolean
+        default: false
+      commit_calibration:
+        description: 'Commit early_swing_calibration.json back to the branch'
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: early-swing-calibration
+  cancel-in-progress: false
+
+env:
+  TZ: Asia/Kolkata
+  PYTHONUNBUFFERED: '1'
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+
+jobs:
+  calibrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    defaults:
+      run:
+        shell: bash
+        working-directory: Scanner
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: Scanner/requirements_early_swing.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements_early_swing.txt
+
+      - name: Restore five-year history cache
+        uses: actions/cache@v4
+        with:
+          path: Scanner/.early_swing_cache
+          key: early-swing-calibration-${{ runner.os }}-${{ inputs.period }}-${{ hashFiles('Scanner/bse1000_clean.csv', 'Scanner/Group_A.csv', 'Scanner/Group_B.csv', 'Scanner/early_swing_scanner.py') }}-${{ github.run_id }}
+          restore-keys: |
+            early-swing-calibration-${{ runner.os }}-${{ inputs.period }}-${{ hashFiles('Scanner/bse1000_clean.csv', 'Scanner/Group_A.csv', 'Scanner/Group_B.csv', 'Scanner/early_swing_scanner.py') }}-
+            early-swing-calibration-${{ runner.os }}-${{ inputs.period }}-
+
+      - name: Compile and test Phase 2/3
+        run: |
+          python -m py_compile early_swing_*.py
+          python -m pytest test_early_swing.py test_early_swing_phase23.py -q
+
+      - name: Run chronological backtest and build calibration
+        env:
+          MAX_SYMBOLS: ${{ inputs.max_symbols }}
+          HISTORY_PERIOD: ${{ inputs.period }}
+          MINIMUM_SAMPLE: ${{ inputs.minimum_sample }}
+          FULL_GRID: ${{ inputs.full_grid }}
+        run: |
+          EXTRA_ARGS=()
+          if [ "$FULL_GRID" = "true" ]; then
+            EXTRA_ARGS+=(--full-grid)
+          fi
+          python early_swing_backtest_cli.py \
+            bse1000_clean.csv Group_A.csv Group_B.csv \
+            --period "$HISTORY_PERIOD" \
+            --max-symbols "$MAX_SYMBOLS" \
+            --minimum-sample "$MINIMUM_SAMPLE" \
+            --entry-method NEXT_OPEN \
+            --target-method FIXED_PERCENT \
+            --calibration-holding 10 \
+            --target-pct 6 \
+            --batch-size 80 \
+            --workers 8 \
+            --cache-hours 168 \
+            "${EXTRA_ARGS[@]}"
+
+      - name: Upload calibration artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: early-swing-calibration-${{ github.run_number }}
+          path: |
+            Scanner/early_swing_calibration.json
+            Scanner/early_swing_calibration_buckets.csv
+            Scanner/early_swing_backtest_trades.csv
+            Scanner/early_swing_backtest_summary.csv
+            Scanner/early_swing_failed_symbols.csv
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Commit production calibration
+        if: ${{ inputs.commit_calibration == true }}
+        working-directory: .
+        run: |
+          if [ "${{ inputs.max_symbols }}" != "0" ]; then
+            echo "Refusing to commit a test calibration. Set max_symbols to 0 for a full-universe production run."
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Scanner/early_swing_calibration.json
+          if git diff --cached --quiet; then
+            echo "No calibration change to commit"
+          else
+            git commit -m "Update Early Swing empirical calibration"
+            git push
+          fi

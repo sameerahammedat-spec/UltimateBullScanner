@@ -28,6 +28,8 @@ from typing import Dict, List, Optional, Sequence
 import pandas as pd
 
 from early_swing_config import DEFAULT_EARLY_SWING_CONFIG, EarlySwingConfig
+from early_swing_alerts import generate_alerts
+from early_swing_calibration import apply_calibration, load_calibration
 from early_swing_engine import analyze_early_swing
 from early_swing_features import classify_market_regime, normalise_ohlcv
 from early_swing_models import EarlySwingCandidate, UniverseRecord
@@ -62,7 +64,25 @@ def _cache_path(cache_dir: Path, stable_key: str) -> Path:
     return cache_dir / f"{digest}.pkl"
 
 
-def _load_cached(cache_dir: Path, record: UniverseRecord, max_age_hours: int) -> Optional[pd.DataFrame]:
+def _period_rank(period: str) -> int:
+    """Approximate requested history length for safe cache compatibility."""
+    text = str(period or "").strip().lower()
+    if text == "max":
+        return 10_000_000
+    try:
+        if text.endswith("y"):
+            return int(text[:-1]) * 365
+        if text.endswith("mo"):
+            return int(text[:-2]) * 30
+        if text.endswith("d"):
+            return int(text[:-1])
+    except ValueError:
+        return 0
+    return 0
+
+
+def _load_cached(cache_dir: Path, record: UniverseRecord, max_age_hours: int,
+                 requested_period: str) -> Optional[pd.DataFrame]:
     path = _cache_path(cache_dir, record.stable_key)
     if not path.exists():
         return None
@@ -75,10 +95,20 @@ def _load_cached(cache_dir: Path, record: UniverseRecord, max_age_hours: int) ->
         if isinstance(payload, dict) and "data" in payload:
             df = normalise_ohlcv(payload.get("data"))
             source_ticker = str(payload.get("source_ticker") or "")
+            cached_period = str(payload.get("history_period") or "")
+            # A one-year daily cache must never silently satisfy a five-year
+            # calibration request. A longer cache may safely serve a shorter
+            # live request.
+            if cached_period and _period_rank(cached_period) < _period_rank(requested_period):
+                return None
+            if not cached_period and _period_rank(requested_period) > _period_rank("1y"):
+                return None
         else:
             # Backward compatibility with the Phase-1 cache format.
             df = normalise_ohlcv(payload)
             source_ticker = ""
+            if _period_rank(requested_period) > _period_rank("1y"):
+                return None
         if not df.empty:
             df.attrs["source_ticker"] = source_ticker or record.preferred_ticker
             return df
@@ -87,13 +117,15 @@ def _load_cached(cache_dir: Path, record: UniverseRecord, max_age_hours: int) ->
     return None
 
 
-def _save_cache(cache_dir: Path, record: UniverseRecord, df: pd.DataFrame) -> None:
+def _save_cache(cache_dir: Path, record: UniverseRecord, df: pd.DataFrame,
+                history_period: str) -> None:
     cache_dir.mkdir(parents=True, exist_ok=True)
     path = _cache_path(cache_dir, record.stable_key)
     temp = path.with_suffix(".tmp")
     payload = {
         "stable_key": record.stable_key,
         "source_ticker": str(df.attrs.get("source_ticker") or record.preferred_ticker),
+        "history_period": history_period,
         "data": df,
     }
     with temp.open("wb") as handle:
@@ -219,7 +251,7 @@ def fetch_histories(
     pending: List[UniverseRecord] = []
 
     for record in records:
-        cached = _load_cached(cache_dir, record, config.cache_hours) if use_cache else None
+        cached = _load_cached(cache_dir, record, config.cache_hours, config.history_period) if use_cache else None
         if cached is not None and not cached.empty:
             result[record.stable_key] = cached
         else:
@@ -233,6 +265,7 @@ def fetch_histories(
     strategy_labels = ("BSE-ID", "NSE-ID", "BSE-CODE")
 
     unresolved = list(pending)
+    record_by_key = {record.stable_key: record for record in records}
     for candidate_index in range(max_strategies):
         eligible = [record for record in unresolved if len(record.ticker_candidates) > candidate_index]
         if not eligible:
@@ -242,6 +275,14 @@ def fetch_histories(
             LOGGER.info("[fallback] Trying %s for %d unresolved securities", pass_label, len(eligible))
         pass_data = _download_strategy_pass(eligible, candidate_index, config, pass_label)
         result.update(pass_data)
+        if use_cache:
+            # Persist every successful strategy pass immediately. A long
+            # five-year calibration run can therefore resume after an
+            # interruption instead of losing all completed batches.
+            for stable_key, frame in pass_data.items():
+                record = record_by_key.get(stable_key)
+                if record is not None:
+                    _save_cache(cache_dir, record, frame, config.history_period)
         unresolved = [record for record in unresolved if record.stable_key not in result]
         if not unresolved:
             break
@@ -249,7 +290,7 @@ def fetch_histories(
     for record in records:
         frame = result.get(record.stable_key)
         if frame is not None and not frame.empty and use_cache:
-            _save_cache(cache_dir, record, frame)
+            _save_cache(cache_dir, record, frame, config.history_period)
 
     LOGGER.info(
         "Price-history resolution complete: %d/%d usable; %d unavailable across all ticker strategies",
@@ -296,6 +337,10 @@ def run_scanner(
     max_symbols: int = 0,
     use_cache: bool = True,
     include_latest_gainers: bool = True,
+    calibration_path: Optional[str] = None,
+    alerts_enabled: Optional[bool] = None,
+    alert_state_path: Optional[str] = None,
+    alert_output_path: Optional[str] = None,
 ) -> List[EarlySwingCandidate]:
     file_records = load_and_deduplicate_universes(universe_paths)
     gainer_records = load_latest_bse_gainers_from_workbook(xlsx_path) if include_latest_gainers else []
@@ -332,7 +377,38 @@ def run_scanner(
             LOGGER.info("Analysed %d/%d", idx, len(records))
 
     candidates.sort(key=lambda candidate: candidate.rules_score, reverse=True)
-    write_early_swing_report(xlsx_path, candidates, regime, date.today())
+
+    calibration_file = calibration_path or config.calibration_file
+    calibration = load_calibration(calibration_file)
+    if calibration:
+        apply_calibration(candidates, calibration, config)
+        LOGGER.info(
+            "Applied empirical calibration from %s (%s canonical trades)",
+            calibration_file,
+            calibration.get("selected_trade_count", 0),
+        )
+    else:
+        LOGGER.info("Calibration file %s not available; probabilities remain NOT_AVAILABLE", calibration_file)
+
+    should_generate_alerts = config.alert_enabled if alerts_enabled is None else alerts_enabled
+    alerts = []
+    if should_generate_alerts:
+        alerts = generate_alerts(
+            candidates,
+            config,
+            state_path=alert_state_path or config.alert_state_file,
+            output_path=alert_output_path or config.alert_output_file,
+        )
+        LOGGER.info("Generated %d new or changed Early Swing alerts", len(alerts))
+
+    write_early_swing_report(
+        xlsx_path,
+        candidates,
+        regime,
+        date.today(),
+        alerts=alerts,
+        calibration=calibration,
+    )
     if failures:
         pd.DataFrame(failures).to_csv("early_swing_failed_symbols.csv", index=False)
     LOGGER.info("Report written to %s", xlsx_path)
@@ -350,6 +426,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workers", type=int, default=DEFAULT_EARLY_SWING_CONFIG.download_workers)
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--no-gainers", action="store_true", help="Do not include the latest BSEGain_* workbook sheet")
+    parser.add_argument("--calibration-file", default=DEFAULT_EARLY_SWING_CONFIG.calibration_file)
+    parser.add_argument("--no-alerts", action="store_true")
+    parser.add_argument("--alert-state-file", default=DEFAULT_EARLY_SWING_CONFIG.alert_state_file)
+    parser.add_argument("--alert-output", default=DEFAULT_EARLY_SWING_CONFIG.alert_output_file)
+    parser.add_argument("--alert-min-score", type=float, default=DEFAULT_EARLY_SWING_CONFIG.alert_minimum_rules_score)
+    parser.add_argument("--alert-cooldown-days", type=int, default=DEFAULT_EARLY_SWING_CONFIG.alert_cooldown_days)
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return parser
 
@@ -366,6 +448,8 @@ def main() -> None:
         maximum_actionable_results=args.top,
         batch_size=max(1, args.batch_size),
         download_workers=max(1, args.workers),
+        alert_minimum_rules_score=max(0.0, min(100.0, args.alert_min_score)),
+        alert_cooldown_days=max(0, args.alert_cooldown_days),
     )
     run_scanner(
         args.workbook,
@@ -374,6 +458,10 @@ def main() -> None:
         max_symbols=args.max_symbols,
         use_cache=not args.no_cache,
         include_latest_gainers=not args.no_gainers,
+        calibration_path=args.calibration_file,
+        alerts_enabled=not args.no_alerts,
+        alert_state_path=args.alert_state_file,
+        alert_output_path=args.alert_output,
     )
 
 

@@ -2,13 +2,13 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Iterable, List, Sequence
+from typing import Iterable, List, Mapping, Optional, Sequence
 
 from openpyxl import load_workbook, Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-from early_swing_models import EarlySwingCandidate, MarketRegime
+from early_swing_models import AlertEvent, EarlySwingCandidate, MarketRegime
 
 
 FONT_NAME = "Arial"
@@ -23,8 +23,10 @@ BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 
 HEADERS = [
     "Rank", "Stock Name", "Symbol / Security Code", "BSE Group", "Sector", "Sources",
-    "Current Price", "Setup Date", "Rally Age", "Setup Type", "Rules Score", "Confidence",
-    "Suggested Status", "Entry From", "Entry To", "Stop Loss", "Target 1", "Target 2",
+    "Current Price", "Setup Date", "Rally Age", "Setup Type", "Rules Score", "Technical Confidence",
+    "Empirical Label", "Empirical Hit Rate %", "Empirical Sample", "Empirical 95% CI",
+    "Statistical Confidence", "Calibration Match", "Suggested Status", "Alert Status", "Alert Reason",
+    "Entry From", "Entry To", "Stop Loss", "Target 1", "Target 2",
     "Reward:Risk", "Stop Distance %", "Position Size", "Nearest Resistance",
     "Distance to Resistance %", "1D Return %", "2D Return %", "5D Return %", "10D Return %",
     "Breakout Volume Ratio", "Current Volume Ratio", "RSI", "ADX", "ATR %", "MACD Histogram",
@@ -42,7 +44,13 @@ def _row(candidate: EarlySwingCandidate, rank: int) -> list:
         rank, candidate.company_name, candidate.symbol, candidate.bse_group, candidate.sector,
         ", ".join(candidate.source_universes), _num(candidate.current_price), candidate.setup_date,
         candidate.rally_age if candidate.rally_age is not None else "N/A", candidate.setup_type,
-        _num(candidate.rules_score, 1), candidate.confidence, candidate.suggested_status,
+        _num(candidate.rules_score, 1), candidate.confidence,
+        candidate.empirical_probability_label, _num(candidate.empirical_hit_rate_pct, 1),
+        candidate.empirical_sample_size,
+        (f"{candidate.empirical_ci_low_pct:.1f}-{candidate.empirical_ci_high_pct:.1f}%"
+         if candidate.empirical_ci_low_pct is not None and candidate.empirical_ci_high_pct is not None else "N/A"),
+        candidate.empirical_confidence, candidate.calibration_fallback_level, candidate.suggested_status,
+        candidate.alert_status, candidate.alert_reason,
         _num(candidate.entry_low), _num(candidate.entry_high), _num(candidate.stop_loss),
         _num(candidate.target1), _num(candidate.target2), _num(candidate.reward_risk),
         _num(candidate.stop_distance_pct), candidate.position_size if candidate.position_size is not None else "N/A",
@@ -85,10 +93,10 @@ def _write_section(ws, start_row: int, title: str, rows: Sequence[EarlySwingCand
             cell = ws.cell(row=row, column=col, value=value)
             cell.font = Font(name=FONT_NAME, size=9)
             cell.border = BORDER
-            cell.alignment = Alignment(horizontal="left" if col in (2, 5, 6, 41, 42, 43, 44) else "center", wrap_text=True)
+            cell.alignment = Alignment(horizontal="left" if col in (2, 5, 6, 21, 49, 50, 51, 52) else "center", wrap_text=True)
             if idx % 2 == 0:
                 cell.fill = ALT_FILL
-        status_cell = ws.cell(row=row, column=13)
+        status_cell = ws.cell(row=row, column=19)
         if candidate.suggested_status == "Enter":
             status_cell.fill = GOOD_FILL
         elif candidate.suggested_status in {"Watch", "Wait for Pullback"}:
@@ -99,8 +107,102 @@ def _write_section(ws, start_row: int, title: str, rows: Sequence[EarlySwingCand
     return row + 1
 
 
+def _write_alert_events(ws, start_row: int, alerts: Sequence[AlertEvent]) -> int:
+    row = start_row
+    title = f"NEW / CHANGED ALERTS — {len(alerts)}"
+    ws.cell(row=row, column=1, value=title).font = Font(name=FONT_NAME, size=11, bold=True, color="FFFFFF")
+    for col in range(1, 14):
+        ws.cell(row=row, column=col).fill = SECTION_FILL
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=13)
+    row += 1
+    headers = [
+        "Stock", "Symbol", "Ticker", "Setup Date", "Setup Type", "Alert Status",
+        "Rules Score", "Empirical Hit Rate %", "Sample", "Current Price", "Entry Zone",
+        "Stop / Target 1", "Reason",
+    ]
+    for col, header in enumerate(headers, 1):
+        cell = ws.cell(row=row, column=col, value=header)
+        cell.font = Font(name=FONT_NAME, size=9, bold=True, color="FFFFFF")
+        cell.fill = HEADER_FILL
+        cell.border = BORDER
+        cell.alignment = Alignment(horizontal="center", wrap_text=True)
+    row += 1
+    if not alerts:
+        ws.cell(row=row, column=1, value="No new or changed alerts on this run").font = Font(name=FONT_NAME, italic=True)
+        return row + 2
+    for idx, event in enumerate(alerts, 1):
+        values = [
+            event.company_name, event.symbol, event.ticker, event.setup_date, event.setup_type,
+            event.alert_status, round(event.rules_score, 1), _num(event.empirical_hit_rate_pct, 1),
+            event.empirical_sample_size, _num(event.current_price),
+            f"{_num(event.entry_low)} - {_num(event.entry_high)}",
+            f"SL {_num(event.stop_loss)} / T1 {_num(event.target1)}", event.reason,
+        ]
+        for col, value in enumerate(values, 1):
+            cell = ws.cell(row=row, column=col, value=value)
+            cell.font = Font(name=FONT_NAME, size=9)
+            cell.border = BORDER
+            cell.alignment = Alignment(horizontal="left" if col in (1, 13) else "center", wrap_text=True)
+            if idx % 2 == 0:
+                cell.fill = ALT_FILL
+        row += 1
+    return row + 1
+
+
+def _write_calibration_summary(ws, start_row: int, calibration: Optional[Mapping[str, object]]) -> int:
+    row = start_row
+    ws.cell(row=row, column=1, value="EMPIRICAL CALIBRATION SUMMARY").font = Font(name=FONT_NAME, bold=True, color="FFFFFF")
+    ws.cell(row=row, column=1).fill = SECTION_FILL
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=8)
+    row += 1
+    if not calibration:
+        ws.cell(row=row, column=1, value="Calibration file not available — live report shows NOT_AVAILABLE, not a fabricated probability")
+        return row + 2
+    definition = calibration.get("definition", {}) if isinstance(calibration, Mapping) else {}
+    metadata = [
+        ("Generated at", calibration.get("generated_at", "N/A")),
+        ("Canonical entry", definition.get("entry_method", "N/A") if isinstance(definition, Mapping) else "N/A"),
+        ("Canonical target", definition.get("target_method", "N/A") if isinstance(definition, Mapping) else "N/A"),
+        ("Holding limit", definition.get("holding_limit", "N/A") if isinstance(definition, Mapping) else "N/A"),
+        ("Canonical trades", calibration.get("selected_trade_count", 0)),
+        ("Minimum sample", calibration.get("minimum_sample", "N/A")),
+    ]
+    for metric, value in metadata:
+        ws.cell(row=row, column=1, value=metric).font = Font(name=FONT_NAME, bold=True)
+        ws.cell(row=row, column=2, value=value)
+        row += 1
+    row += 1
+    headers = ["Level", "Bucket", "Sample", "Hit Rate %", "95% CI Low", "95% CI High", "Avg Return %", "False Breakout %"]
+    for col, header in enumerate(headers, 1):
+        cell = ws.cell(row=row, column=col, value=header)
+        cell.font = Font(name=FONT_NAME, size=9, bold=True, color="FFFFFF")
+        cell.fill = HEADER_FILL
+        cell.border = BORDER
+    row += 1
+    buckets = calibration.get("buckets", []) if isinstance(calibration, Mapping) else []
+    useful = [b for b in buckets if isinstance(b, Mapping) and int(b.get("sample_size") or 0) >= int(calibration.get("minimum_sample", 30))]
+    useful = sorted(useful, key=lambda b: int(b.get("sample_size") or 0), reverse=True)[:20]
+    for item in useful:
+        values = [
+            item.get("level"), item.get("key"), item.get("sample_size"), _num(item.get("hit_rate_pct"), 1),
+            _num(item.get("ci_low_pct"), 1), _num(item.get("ci_high_pct"), 1),
+            _num(item.get("average_return_pct"), 2), _num(item.get("false_breakout_rate_pct"), 1),
+        ]
+        for col, value in enumerate(values, 1):
+            cell = ws.cell(row=row, column=col, value=value)
+            cell.border = BORDER
+            cell.alignment = Alignment(wrap_text=True)
+        row += 1
+    if not useful:
+        ws.cell(row=row, column=1, value="No bucket currently meets the minimum sample threshold")
+        row += 1
+    return row + 1
+
+
 def write_early_swing_report(xlsx_path: str, candidates: Sequence[EarlySwingCandidate],
-                             regime: MarketRegime, report_date: date) -> str:
+                             regime: MarketRegime, report_date: date,
+                             alerts: Sequence[AlertEvent] = (),
+                             calibration: Optional[Mapping[str, object]] = None) -> str:
     try:
         workbook = load_workbook(xlsx_path)
     except FileNotFoundError:
@@ -128,6 +230,7 @@ def write_early_swing_report(xlsx_path: str, candidates: Sequence[EarlySwingCand
     }]
 
     row = 3
+    row = _write_alert_events(ws, row, alerts)
     row = _write_section(ws, row, "ACTIONABLE EARLY SWING SETUPS", actionable)
     row = _write_section(ws, row, "STRONG SETUPS — WAIT FOR PULLBACK", pullback)
     row = _write_section(ws, row, "EARLY SETUPS — WATCH / NEED CONFIRMATION", watch)
@@ -155,10 +258,13 @@ def write_early_swing_report(xlsx_path: str, candidates: Sequence[EarlySwingCand
         ws.cell(row=row, column=2, value=value)
         row += 1
 
+    row += 1
+    row = _write_calibration_summary(ws, row, calibration)
+
     widths = {1: 8, 2: 32, 3: 18, 4: 12, 5: 20, 6: 24}
     for col in range(1, len(HEADERS) + 1):
         ws.column_dimensions[get_column_letter(col)].width = widths.get(col, 14)
-    for col in (41, 42, 43, 44):
+    for col in (21, 49, 50, 51, 52):
         ws.column_dimensions[get_column_letter(col)].width = 42
     ws.freeze_panes = "G5"
     workbook.save(xlsx_path)

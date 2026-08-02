@@ -78,6 +78,38 @@ class EarlySwingConfig:
     backtest_slippage_pct: float = 0.15
     backtest_cost_pct: float = 0.20
 
+    # Phase 2: walk-forward backtest and pooled empirical calibration
+    backtest_holding_windows: Tuple[int, ...] = (3, 5, 7, 10, 15)
+    backtest_entry_methods: Tuple[str, ...] = ("NEXT_OPEN", "ABOVE_SIGNAL_HIGH")
+    backtest_target_methods: Tuple[str, ...] = ("FIXED_PERCENT", "CANDIDATE_TARGET1")
+    backtest_minimum_gap_sessions: int = 3
+    calibration_minimum_sample: int = 30
+    calibration_medium_sample: int = 100
+    calibration_high_sample: int = 300
+    calibration_file: str = "early_swing_calibration.json"
+    calibration_trades_file: str = "early_swing_backtest_trades.csv"
+    calibration_summary_file: str = "early_swing_backtest_summary.csv"
+    calibration_history_period: str = "5y"
+    calibration_cache_hours: int = 168
+    calibration_score_bands: Tuple[Tuple[float, float, str], ...] = (
+        (85.0, 100.0, "85-100"),
+        (75.0, 84.9999, "75-84"),
+        (65.0, 74.9999, "65-74"),
+        (0.0, 64.9999, "0-64"),
+    )
+
+    # Phase 3: persistent alert generation and duplicate suppression
+    alert_enabled: bool = True
+    alert_minimum_rules_score: float = 75.0
+    alert_minimum_empirical_hit_rate_pct: float = 0.0
+    alert_minimum_empirical_sample: int = 0
+    alert_cooldown_days: int = 5
+    alert_setup_expiry_days: int = 15
+    alert_state_file: str = "early_swing_alert_state.json"
+    alert_output_file: str = "early_swing_alerts.csv"
+    alert_allow_watch_status: bool = False
+    alert_price_tolerance_pct: float = 0.50
+
     # Scoring component maxima. Delivery is optional and therefore excluded from
     # the live maximum when unavailable; the score is normalised to 100.
     score_weights: Dict[str, float] = field(default_factory=lambda: {

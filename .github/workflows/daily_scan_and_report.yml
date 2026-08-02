@@ -66,6 +66,7 @@ jobs:
               "BSE1000_",
               "GroupAB_",
               "Explosive_",
+              "EarlySwing_",
           )
 
           workbook = load_workbook(report_path)
@@ -97,6 +98,17 @@ jobs:
           key: group-ab-price-${{ runner.os }}-${{ steps.prepare_workbook.outputs.report_date }}-${{ hashFiles('Scanner/Group_A.csv', 'Scanner/Group_B.csv', 'Scanner/group_ab_scanner.py') }}
           restore-keys: |
             group-ab-price-${{ runner.os }}-${{ steps.prepare_workbook.outputs.report_date }}-
+
+
+      - name: Restore Early Swing history and alert state
+        uses: actions/cache@v4
+        with:
+          path: |
+            Scanner/.early_swing_cache
+            Scanner/early_swing_alert_state.json
+          key: early-swing-state-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            early-swing-state-${{ runner.os }}-
 
       - name: Validate Group A/B scanner and universe
         run: |
@@ -166,6 +178,22 @@ jobs:
             --workers 8 \
             --explosive-limit 30
 
+
+      - name: Run Early Swing Rally Scanner Phase 2/3
+        continue-on-error: true
+        env:
+          REPORT_FILE: ${{ steps.prepare_workbook.outputs.report_file }}
+        run: |
+          python early_swing_scanner.py "$REPORT_FILE" \
+            bse1000_clean.csv \
+            Group_A.csv \
+            Group_B.csv \
+            --calibration-file early_swing_calibration.json \
+            --alert-state-file early_swing_alert_state.json \
+            --alert-output early_swing_alerts.csv \
+            --batch-size 80 \
+            --workers 8
+
       - name: Verify final workbook sheets
         if: always()
         env:
@@ -186,7 +214,7 @@ jobs:
           for sheet_name in workbook.sheetnames:
               print(f"  - {sheet_name}")
 
-          required_prefixes = ("Scan_", "BSEGain_", "BSE1000_", "GroupAB_")
+          required_prefixes = ("Scan_", "BSEGain_", "BSE1000_", "GroupAB_", "EarlySwing_")
           missing = [
               prefix for prefix in required_prefixes
               if not any(name.startswith(prefix) for name in workbook.sheetnames)
@@ -209,6 +237,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.prepare_workbook.outputs.report_name }}
-          path: Scanner/${{ steps.prepare_workbook.outputs.report_file }}
+          path: |
+            Scanner/${{ steps.prepare_workbook.outputs.report_file }}
+            Scanner/early_swing_alerts.csv
+            Scanner/early_swing_failed_symbols.csv
           if-no-files-found: error
           retention-days: 30

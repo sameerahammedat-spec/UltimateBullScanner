@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.early_swing_cache/
+bse_company_name_cache.json
+early_swing_failed_symbols.csv
+early_swing_calibration_TEST.json
+early_swing_backtest_summary_TEST.csv
+early_swing_backtest_trades_TEST.csv
+early_swing_calibration_buckets_TEST.csv
+trading_toolkit_test.xlsx
+*_BACKUP.py
+*_BEFORE_*.py
