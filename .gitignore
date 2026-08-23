@@ -10,3 +10,4 @@ early_swing_calibration_buckets_TEST.csv
 trading_toolkit_test.xlsx
 *_BACKUP.py
 *_BEFORE_*.py
+.env

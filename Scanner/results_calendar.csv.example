@@ -1,0 +1,3 @@
+security_code,security_id,isin,company_name,result_date,board_meeting_date,expected_time,source,result_type,release_confirmed,release_time
+500001,TESTA,,Test A Ltd,2026-08-10,2026-08-10,14:30,MANUAL,Quarterly Results,false,
+500002,TESTB,,Test B Ltd,2026-08-10,2026-08-10,15:00,MANUAL,Quarterly Results,false,

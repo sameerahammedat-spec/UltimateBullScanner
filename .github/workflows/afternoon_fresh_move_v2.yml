@@ -1,0 +1,72 @@
+name: Afternoon Fresh Move Alerts
+
+on:
+  schedule:
+    # 08:20 UTC = 1:50 PM IST, Monday-Friday.  The Python watcher waits until
+    # exactly 2:00 PM IST and stops at 3:10 PM IST. Starting the GitHub job a
+    # few minutes early gives the hosted runner time to queue and install deps.
+    - cron: '20 8 * * 1-5'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: afternoon-fresh-move-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  afternoon-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    defaults:
+      run:
+        working-directory: Scanner
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: Scanner/requirements.txt
+
+      - name: Install scanner dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run 2PM-3:10PM fresh-move watcher
+        env:
+          # Existing Gmail secrets are optional fallback alerts.
+          GMAIL_SENDER: ${{ secrets.GMAIL_SENDER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          REPORT_RECIPIENT: ${{ secrets.REPORT_RECIPIENT }}
+
+          # Twilio immediate SMS/voice/WhatsApp alerts.
+          TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
+          TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
+          TWILIO_FROM_NUMBER: ${{ secrets.TWILIO_FROM_NUMBER }}
+          ALERT_PHONE_NUMBER: ${{ secrets.ALERT_PHONE_NUMBER }}
+
+          # WhatsApp: use an approved Twilio WhatsApp sender and ContentSid template.
+          TWILIO_WHATSAPP_FROM: ${{ secrets.TWILIO_WHATSAPP_FROM }}
+          TWILIO_WHATSAPP_CONTENT_SID: ${{ secrets.TWILIO_WHATSAPP_CONTENT_SID }}
+          TWILIO_WHATSAPP_ALLOW_FREEFORM: ${{ secrets.TWILIO_WHATSAPP_ALLOW_FREEFORM }}
+        run: |
+          python afternoon_fresh_move_scanner.py \
+            --watch \
+            --group-a Group_A.csv \
+            --group-b Group_B.csv \
+            --smallcap bse_smallcap250_clean.csv \
+            --output-dir afternoon_reports
+
+      - name: Upload afternoon scan evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: afternoon-fresh-moves-${{ github.run_id }}
+          path: Scanner/afternoon_reports/
+          if-no-files-found: warn
+          retention-days: 30
