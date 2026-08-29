@@ -52,6 +52,9 @@ from afternoon_momentum_engine import (
     score_candidate,
 )
 from market_scanner import _SHARED_SESSION
+from results_monitor import ResultsMonitor
+from results_score import enrich_results_score
+
 
 
 DEFAULT_GROUP_A = "Group_A.csv"
@@ -70,6 +73,7 @@ LATEST_COLUMNS = [
     "hist_samples", "hist_hit_5_pct", "hist_hit_8_pct", "hist_hit_10_pct", "hist_hit_15_pct", "hist_hit_20_pct",
     "hist_p75_mfe_pct", "catalyst_strength", "catalyst_reason", "catalyst_evidence",
     "reasons", "warnings", "hard_rejects",
+    "results_scheduled_today", "results_release_confirmed", "results_result_date", "results_board_meeting_date", "results_expected_time", "results_source", "results_type", "results_priority", "results_priority_bonus", "extension_penalty", "score_before_results_overlay", "results_setup_score",
 ]
 
 
@@ -464,6 +468,13 @@ class AfternoonScanner:
         self._announcements: List[Dict[str, Any]] = []
         self._announcements_fetched_at: Optional[datetime] = None
         self._cycle_number: int = 0
+        self.results_monitor = ResultsMonitor(
+            universe,
+            calendar_path=os.getenv("RESULTS_CALENDAR_PATH", "results_calendar.csv"),
+            refresh_minutes=int(os.getenv("RESULTS_REFRESH_MINUTES", "10")),
+            timeout_seconds=int(os.getenv("RESULTS_REQUEST_TIMEOUT", "15")),
+        )
+
 
     def _get_announcements(self, now: datetime) -> List[Dict[str, Any]]:
         # The current catalyst module fetches symbol/company-specific BSE and
@@ -485,6 +496,33 @@ class AfternoonScanner:
             else:
                 scan_universe = stage0
                 source_note = stage0_status
+
+        # Results Catalyst: force today's scheduled A/B result names into
+        # stage-0 verification so they are monitored even when they are not
+        # already among BSE's live gainers.
+        results_watchlist = self.results_monitor.watchlist(now)
+        if results_watchlist:
+            existing = {
+                str(x.get("security_code") or x.get("security_id") or x.get("ticker")).upper()
+                for x in scan_universe
+            }
+            added = 0
+            for result_stock in results_watchlist:
+                key = str(
+                    result_stock.get("security_code")
+                    or result_stock.get("security_id")
+                    or result_stock.get("ticker")
+                ).upper()
+                if key and key not in existing:
+                    result_stock = dict(result_stock)
+                    result_stock["stage0_source"] = "RESULTS_TODAY_PRIORITY"
+                    scan_universe.append(result_stock)
+                    existing.add(key)
+                    added += 1
+            print(
+                f"[Results monitor] today's scheduled results matched={len(results_watchlist)} "
+                f"| added to stage0={added}"
+            )
 
         print(
             f"[Afternoon stage0] {source_note}: verifying {len(scan_universe)} of "
@@ -643,6 +681,7 @@ class AfternoonScanner:
                     f"Technical invalidation requires {risk['risk_pct']:.2f}% risk (> {self.config.max_entry_risk_pct:.2f}%)"
                 )
 
+            results_event = self.results_monitor.event_for_stock(stock, now)
             item = {
                 **stock,
                 "ticker": ticker,
@@ -663,6 +702,33 @@ class AfternoonScanner:
                 **score_data,
                 "_daily_frame": daily,
             }
+
+            if results_event is not None:
+                item["results_scheduled_today"] = True
+                item["results_result_date"] = results_event.result_date
+                item["results_board_meeting_date"] = results_event.board_meeting_date
+                item["results_expected_time"] = results_event.expected_time
+                item["results_source"] = results_event.source
+                item["results_type"] = results_event.result_type
+                item["results_release_confirmed"] = results_event.release_confirmed
+                item["results_release_time"] = results_event.release_time
+                item["results_priority"] = (
+                    "A_RESULTS_TODAY"
+                    if str(stock.get("group") or "").upper() == "A"
+                    else "B_RESULTS_TODAY"
+                    if str(stock.get("group") or "").upper() == "B"
+                    else "RESULTS_TODAY"
+                )
+                item = enrich_results_score(
+                    item,
+                    results_scheduled_today=True,
+                    release_confirmed=results_event.release_confirmed,
+                )
+            else:
+                item["results_scheduled_today"] = False
+                item["results_release_confirmed"] = False
+                item["results_priority"] = "NORMAL"
+
             (rejected if item["rejected"] else provisional).append(item)
 
         provisional.sort(key=lambda x: x["score"], reverse=True)
