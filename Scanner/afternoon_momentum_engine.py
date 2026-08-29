@@ -61,16 +61,23 @@ def clean_ohlcv(df):
     else: out.columns=[str(c).strip().lower().replace(' ','_') for c in out.columns]
     out=out.rename(columns={'adj_close':'close','adjclose':'close','datetime':'date','timestamp':'date'})
     for col in ['open','high','low','close','volume']:
-        matches=[i for i,c in enumerate(out.columns) if c==col]
-        if not matches: out[col]=np.nan
-        elif len(matches)>1:
-            s=out.iloc[:,matches[0]]
-            if isinstance(s,pd.DataFrame): s=s.iloc[:,0]
-            out[col]=s
-            out=out.iloc[:,[i for i in range(len(out.columns)) if i not in matches[1:]]]
-        s=out[col]
-        if isinstance(s,pd.DataFrame): s=s.iloc[:,0]
-        out[col]=pd.to_numeric(s,errors='coerce')
+        matches = [i for i, c in enumerate(out.columns) if c == col]
+        if not matches:
+            out[col] = np.nan
+            continue
+        # Use the first matching column as the canonical source
+        s = out.iloc[:, matches[0]]
+        if isinstance(s, pd.DataFrame):
+            s = s.iloc[:, 0]
+        # Coerce to numeric and assign by position to avoid label-alignment edge cases
+        numeric = pd.to_numeric(s, errors='coerce')
+        out[col] = numeric.values
+        # Drop any duplicate matched columns beyond the first to keep a single canonical column
+        if len(matches) > 1:
+            drop_idxs = [i for i in matches[1:]]
+            keep = [i for i in range(len(out.columns)) if i not in drop_idxs]
+            out = out.iloc[:, keep]
+
     if 'date' in out.columns:
         idx=pd.to_datetime(out['date'],errors='coerce'); out=out.drop(columns=['date']); out.index=idx
     elif not isinstance(out.index,pd.DatetimeIndex): out.index=pd.to_datetime(out.index,errors='coerce')

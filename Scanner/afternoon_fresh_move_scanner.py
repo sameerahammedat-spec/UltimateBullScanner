@@ -23,6 +23,7 @@ import math
 import os
 import sys
 import time as time_module
+import logging
 from dataclasses import asdict
 from datetime import date, datetime, timedelta, time
 from pathlib import Path
@@ -54,6 +55,10 @@ from afternoon_momentum_engine import (
 from market_scanner import _SHARED_SESSION
 from results_monitor import ResultsMonitor
 from results_score import enrich_results_score
+from ticker_resolver import (
+    candidate_tickers, resolve_history, has_usable_ohlcv as resolver_has_usable_ohlcv,
+    is_equity_company, fetch_history,
+)
 
 
 
@@ -82,13 +87,32 @@ LATEST_COLUMNS = [
 # ---------------------------------------------------------------------------
 
 def _read_csv_robust(path: str) -> pd.DataFrame:
-    # Group_A.csv/Group_B.csv in the supplied project have harmless trailing
-    # commas after the declared columns. index_col=False prevents pandas from
-    # accidentally treating the first data columns as an inferred multi-index.
+    """Read the BSE universe without losing columns or emitting trailing-field warnings.
+
+    Some supplied BSE CSV exports contain harmless extra empty fields after the
+    declared header.  We deliberately trim *only trailing extra fields* and
+    never let pandas infer an index from malformed row widths.
+    """
+    def _read(encoding=None):
+        import csv
+        with open(path, "r", encoding=encoding or "utf-8-sig", newline="") as fh:
+            rows = list(csv.reader(fh))
+        if not rows:
+            return pd.DataFrame()
+        header = [str(x).strip() for x in rows[0]]
+        width = len(header)
+        normalized = []
+        for row in rows[1:]:
+            if len(row) < width:
+                row = row + [""] * (width - len(row))
+            elif len(row) > width:
+                row = row[:width]
+            normalized.append(row)
+        return pd.DataFrame(normalized, columns=header, dtype=str).fillna("")
     try:
-        return pd.read_csv(path, dtype=str, keep_default_na=False, index_col=False)
+        return _read()
     except UnicodeDecodeError:
-        return pd.read_csv(path, dtype=str, keep_default_na=False, index_col=False, encoding="latin-1")
+        return _read("latin-1")
 
 
 def _clean(value: Any) -> str:
@@ -121,25 +145,38 @@ def load_afternoon_universe(group_a_path: str, group_b_path: str, smallcap_path:
                 continue
             if not security_id and not security_code:
                 continue
+            instrument = _clean(row.get("Instrument")).upper()
+            # The BSE scrip master labels fund/ETF/segregated-plan units as
+            # Equity too. This scanner is for company equities only.
+            if instrument and instrument != "EQUITY":
+                continue
             name = _clean(row.get("Security Name")) or _clean(row.get("Issuer Name")) or security_id or security_code
             key = isin or f"{group_label}:{security_code or security_id}"
-            primary = f"{security_id}.BO" if _valid_bse_id(security_id) else f"{security_code}.BO"
-            alternates = []
-            if security_code:
-                alternates.append(f"{security_code}.BO")
-            if security_id:
-                alternates.append(f"{security_id}.NS")
+            # Yahoo's NSE listing is the preferred data source when a company
+            # has one.  BSE remains a first-class fallback, not the identity.
             record = {
                 "security_code": security_code,
                 "security_id": security_id,
                 "name": name,
                 "group": group_label,
                 "isin": isin,
+                "instrument": _clean(row.get("Instrument")).upper(),
                 "is_smallcap": bool((isin and isin in smallcap_isins) or security_id in smallcap_symbols),
-                "ticker": primary,
-                "alternate_tickers": list(dict.fromkeys(x for x in alternates if x != primary)),
+                # Canonical resolver candidates: NSE first, then BSE, then numeric BSE.
+                "ticker": "",
+                "alternate_tickers": [],
             }
-            records[key] = record
+            candidates = candidate_tickers({
+                "security_code": security_code,
+                "security_id": security_id,
+                "symbol": security_id or security_code,
+                "ticker": f"{security_id}.NS" if security_id else f"{security_code}.BO",
+            })
+            if candidates:
+                record["ticker"] = candidates[0]
+                record["alternate_tickers"] = list(candidates[1:])
+            if is_equity_company(record):
+                records[key] = record
 
     # Any smallcap constituent missing from A/B is still included so the stated
     # universe remains BSE Smallcap + A/B, not merely their current overlap.
@@ -151,16 +188,18 @@ def load_afternoon_universe(group_a_path: str, group_b_path: str, smallcap_path:
             continue
         name = _clean(row.get("Company Name")) or symbol
         key = isin or f"SMALLCAP:{symbol}"
-        records[key] = {
+        record = {
             "security_code": "",
             "security_id": symbol,
             "name": name,
             "group": "",
             "isin": isin,
+            "instrument": "EQUITY",
             "is_smallcap": True,
-            "ticker": f"{symbol}.BO",
-            "alternate_tickers": [f"{symbol}.NS"],
+            "ticker": f"{symbol}.NS",
+            "alternate_tickers": [f"{symbol}.BO"],
         }
+        records[key] = record
 
     result = list(records.values())
     result.sort(key=lambda r: (r.get("group") != "A", not r.get("is_smallcap"), r.get("security_id", "")))
@@ -350,6 +389,92 @@ def _extract_ticker_frame(downloaded: pd.DataFrame, ticker: str, ticker_count: i
     return frame
 
 
+def _has_usable_ohlcv(frame: Optional[pd.DataFrame]) -> bool:
+    """Compatibility wrapper around the canonical resolver validation."""
+    return resolver_has_usable_ohlcv(frame)
+
+
+def _history_one(ticker_symbol: str, period: str, interval: str) -> pd.DataFrame:
+    for use_session in (True, False):
+        try:
+            if use_session:
+                obj = yf.Ticker(ticker_symbol, session=_SHARED_SESSION)
+            else:
+                obj = yf.Ticker(ticker_symbol)
+            frame = obj.history(period=period, interval=interval, auto_adjust=False)
+            if _has_usable_ohlcv(frame):
+                return frame
+        except Exception:
+            continue
+    return pd.DataFrame()
+
+
+def batch_download_resolved(
+    stocks: Sequence[Dict[str, Any]],
+    period: str,
+    interval: str,
+    batch_size: int,
+    label: str = "[Afternoon]",
+) -> Dict[str, pd.DataFrame]:
+    """Fast canonical batch path with deterministic per-stock fallback.
+
+    Only canonical NSE/BSE candidates enter Yahoo. A successful frame carries
+    ``source_ticker`` so downstream stages can enforce the single-source rule.
+    """
+    results: Dict[str, pd.DataFrame] = {}
+    primary_map: Dict[str, str] = {}
+    # Map normalized per-stock key -> original stock ticker string used by callers
+    stockkey_to_orig_ticker: Dict[str, str] = {}
+    batch_candidates: List[str] = []
+    eligible = 0
+
+    def _stock_key(stock: Dict[str, Any]) -> str:
+        return str(stock.get("security_code") or stock.get("security_id") or stock.get("ticker") or "").upper()
+
+    for stock in stocks:
+        if not is_equity_company(stock):
+            stock["resolution_status"] = "NON_EQUITY"
+            continue
+        stock_key = _stock_key(stock)
+        candidates = candidate_tickers(stock)
+        if not stock_key or not candidates:
+            continue
+        eligible += 1
+        primary_map[stock_key] = candidates[0]
+        stockkey_to_orig_ticker[stock_key] = str(stock.get("ticker") or "")
+        batch_candidates.append(candidates[0])
+
+    batched = batch_download(list(dict.fromkeys(batch_candidates)), period, interval, batch_size, auto_adjust=False)
+    missing: List[Dict[str, Any]] = []
+    for stock in stocks:
+        stock_key = _stock_key(stock)
+        candidate = primary_map.get(stock_key)
+        frame = batched.get(candidate, pd.DataFrame()) if candidate else pd.DataFrame()
+        if candidate and _has_usable_ohlcv(frame):
+            frame.attrs["source_ticker"] = candidate
+            orig_ticker = stockkey_to_orig_ticker.get(stock_key, "")
+            results[orig_ticker] = frame
+            stock["resolved_ticker"] = candidate
+            stock["resolution_status"] = "RESOLVED"
+        elif candidate:
+            missing.append(stock)
+
+    resolved = 0
+    for stock in missing:
+        stock_key = _stock_key(stock)
+        ticker, frame, status = resolve_history(
+            yf, stock, period, interval, session=_SHARED_SESSION, retries=1
+        )
+        if status == "RESOLVED" and _has_usable_ohlcv(frame):
+            frame.attrs["source_ticker"] = ticker
+            orig_ticker = stockkey_to_orig_ticker.get(stock_key, str(stock.get("ticker") or ""))
+            results[orig_ticker] = frame
+            stock["resolved_ticker"] = ticker
+            stock["resolution_status"] = "RESOLVED"
+            resolved += 1
+    print(f"{label} {interval}: eligible={eligible} batch_ok={len(results)} fallback_resolved={resolved} skipped_non_equity={sum(1 for x in stocks if x.get('resolution_status') == 'NON_EQUITY')}")
+    return results
+
 def batch_download(
     tickers: Sequence[str],
     period: str,
@@ -369,10 +494,9 @@ def batch_download(
                 group_by="ticker",
                 auto_adjust=auto_adjust,
                 progress=False,
-                threads=True,
+                threads=False,
                 prepost=False,
-                timeout=20,
-                session=_SHARED_SESSION,
+                timeout=12,
             )
         except Exception as exc:
             # Newer yfinance versions use curl_cffi and may reject a
@@ -384,7 +508,7 @@ def batch_download(
                     downloaded = yf.download(
                         tickers=list(batch), period=period, interval=interval,
                         group_by="ticker", auto_adjust=auto_adjust, progress=False,
-                        threads=True, prepost=False, timeout=20,
+                        threads=False, prepost=False, timeout=12,
                     )
                 except Exception as retry_exc:
                     print(f"[Afternoon] batch download failed after sessionless retry: {retry_exc}")
@@ -394,32 +518,17 @@ def batch_download(
                 continue
         for ticker in batch:
             frame = _extract_ticker_frame(downloaded, ticker, len(batch))
-            if frame is not None and not frame.empty:
+            if _has_usable_ohlcv(frame):
+                frame.attrs["source_ticker"] = ticker
                 results[ticker] = frame
     return results
 
 
 def _fallback_one(stock: Dict[str, Any], period: str, interval: str) -> tuple[str, pd.DataFrame]:
-    choices = [stock.get("ticker"), *stock.get("alternate_tickers", [])]
-    for ticker_symbol in dict.fromkeys(x for x in choices if x):
-        try:
-            try:
-                ticker_obj = yf.Ticker(ticker_symbol, session=_SHARED_SESSION)
-                frame = ticker_obj.history(period=period, interval=interval, auto_adjust=False)
-            except Exception as session_exc:
-                if "session" not in str(session_exc).lower() and "curl_cffi" not in str(session_exc).lower():
-                    raise
-                frame = yf.Ticker(ticker_symbol).history(period=period, interval=interval, auto_adjust=False)
-            if frame is not None and not frame.empty:
-                return ticker_symbol, frame
-        except Exception:
-            continue
-    return stock.get("ticker", ""), pd.DataFrame()
-
-
-# ---------------------------------------------------------------------------
-# Scanner
-# ---------------------------------------------------------------------------
+    ticker, frame, status = resolve_history(
+        yf, stock, period, interval, session=_SHARED_SESSION, retries=1
+    )
+    return ticker, frame if status == "RESOLVED" else pd.DataFrame()
 
 def _preliminary_rank(prefilter: PrefilterResult) -> float:
     move = min(prefilter.window_move_pct or 0, 7.0)
@@ -531,13 +640,11 @@ class AfternoonScanner:
         if not scan_universe:
             return []
 
-        tickers = [stock["ticker"] for stock in scan_universe]
-        frames = batch_download(
-            tickers,
+        frames = batch_download_resolved(
+            scan_universe,
             period="1d",
             interval="5m",
             batch_size=self.config.broad_batch_size,
-            auto_adjust=False,
         )
         candidates = []
         usable = 0
@@ -570,8 +677,10 @@ class AfternoonScanner:
         """
         self._cycle_number += 1
         scan_universe = [dict(x) for x in self.universe] if self.config.full_universe_scan else yahoo_fallback_universe(self.universe, self._cycle_number, self.config)
-        tickers = [x["ticker"] for x in scan_universe]
-        frames = batch_download(tickers, period="1d", interval="5m", batch_size=self.config.broad_batch_size, auto_adjust=False)
+        frames = batch_download_resolved(
+            scan_universe, period="1d", interval="5m",
+            batch_size=self.config.broad_batch_size,
+        )
         early = []
         for stock in scan_universe:
             frame = frames.get(stock["ticker"])
@@ -598,21 +707,31 @@ class AfternoonScanner:
     def deep_scan(self, broad_candidates: List[Dict[str, Any]], now: datetime) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         if not broad_candidates:
             return [], []
-        tickers = [x["ticker"] for x in broad_candidates]
-        intraday_frames = batch_download(
-            tickers,
+        intraday_frames = batch_download_resolved(
+            broad_candidates,
             period=self.config.intraday_history_period,
             interval="5m",
             batch_size=min(40, self.config.broad_batch_size),
-            auto_adjust=False,
         )
-        daily_frames = batch_download(
-            tickers,
-            period=self.config.daily_history_period,
-            interval="1d",
-            batch_size=min(60, self.config.broad_batch_size),
-            auto_adjust=True,
-        )
+
+        # IMPORTANT: daily history is fetched ONLY from the ticker that
+        # successfully supplied the 5m frame. Never re-resolve daily data,
+        # because that can silently switch NSE -> BSE (or vice versa).
+        daily_frames: Dict[str, pd.DataFrame] = {}
+        for stock in broad_candidates:
+            key = str(stock.get("ticker") or "")
+            intraday = intraday_frames.get(key, pd.DataFrame())
+            source = str(getattr(intraday, "attrs", {}).get("source_ticker") or stock.get("resolved_ticker") or "")
+            if not source:
+                continue
+            daily = fetch_history(
+                yf, source, self.config.daily_history_period, "1d",
+                session=_SHARED_SESSION, retries=1,
+            )
+            if _has_usable_ohlcv(daily):
+                daily.attrs["source_ticker"] = source
+                daily_frames[key] = daily
+                stock["daily_source_ticker"] = source
 
         # Sensex is only used for relative afternoon strength. Failure is a
         # missing feature, not a scanner failure.
@@ -624,32 +743,38 @@ class AfternoonScanner:
         rejected: List[Dict[str, Any]] = []
         clock = _current_clock(now, self.config)
         for stock in broad_candidates:
-            ticker = stock["ticker"]
-            intraday = intraday_frames.get(ticker, pd.DataFrame())
-            daily = daily_frames.get(ticker, pd.DataFrame())
-            if intraday.empty or daily.empty:
-                # Only a small shortlist reaches this point, so alternate ticker
-                # fallbacks are affordable here and improve BSE symbol coverage.
-                resolved, fallback_intraday = _fallback_one(stock, self.config.intraday_history_period, "5m")
-                if not fallback_intraday.empty:
+            original_ticker = str(stock["ticker"])
+            ticker = str(stock.get("resolved_ticker") or original_ticker)
+            intraday = intraday_frames.get(original_ticker, pd.DataFrame())
+            daily = daily_frames.get(original_ticker, pd.DataFrame())
+
+            # If the fast batch missed the primary ticker, resolve through the
+            # same canonical NSE/BSE resolver used by the diagnostic.
+            if not _has_usable_ohlcv(intraday):
+                resolved, fallback_intraday = _fallback_one(
+                    stock, self.config.intraday_history_period, "5m"
+                )
+                if _has_usable_ohlcv(fallback_intraday):
                     ticker = resolved
                     intraday = fallback_intraday
-                if daily.empty:
-                    try:
-                        try:
-                            daily = yf.Ticker(ticker, session=_SHARED_SESSION).history(
-                                period=self.config.daily_history_period, interval="1d", auto_adjust=True
-                            )
-                        except Exception as session_exc:
-                            if "session" not in str(session_exc).lower() and "curl_cffi" not in str(session_exc).lower():
-                                raise
-                            daily = yf.Ticker(ticker).history(
-                                period=self.config.daily_history_period, interval="1d", auto_adjust=True
-                            )
-                    except Exception:
-                        daily = pd.DataFrame()
-            if intraday.empty or daily.empty:
+
+            # Daily and intraday analysis must use the SAME Yahoo source ticker.
+            # Never combine NSE intraday bars with BSE daily bars (or vice versa).
+            intraday_source = str(
+                getattr(intraday, "attrs", {}).get("source_ticker") or ticker
+            )
+            if intraday_source:
+                ticker = intraday_source
+
+            daily_source = str(getattr(daily, "attrs", {}).get("source_ticker") or "")
+            # Exact-source invariant: if daily is missing or from another
+            # source, reject the candidate rather than re-resolving it.
+            if not _has_usable_ohlcv(daily) or daily_source != ticker:
                 continue
+
+            if not _has_usable_ohlcv(intraday) or not _has_usable_ohlcv(daily):
+                continue
+            stock["resolved_ticker"] = ticker
 
             # Recompute the live window from the richer 15d frame so all deep
             # metrics reference exactly the same timestamps/data source.
@@ -964,6 +1089,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
+
+    # Suppress noisy yfinance output (diagnostic script does this too)
+    for name in ("yfinance", "yfinance.multi", "yfinance.scrapers"):
+        logging.getLogger(name).setLevel(logging.CRITICAL)
+
     universe = load_afternoon_universe(args.group_a, args.group_b, args.smallcap)
     a_count = sum(1 for x in universe if x.get("group") == "A")
     b_count = sum(1 for x in universe if x.get("group") == "B")
