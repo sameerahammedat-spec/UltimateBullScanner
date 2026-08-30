@@ -11,7 +11,7 @@ pipeline {
     triggers {
         // Jenkins controller/agent timezone MUST be Asia/Kolkata.
         // Schedule: 13:30 IST, Monday-Friday.
-        cron('30 13 * * 1-5')
+        cron('TZ=Asia/Kolkata\n30 13 * * 1-5')
     }
 
     environment {
