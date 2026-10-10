@@ -41,12 +41,12 @@ jobs:
           now = datetime.now(ZoneInfo("Asia/Kolkata"))
           print(f"Current India time: {now:%Y-%m-%d %H:%M:%S %Z}")
 
-          if now.weekday() >= 5:
+          if now.weekday() >= 7:
               raise SystemExit("STOP: Saturday/Sunday. Run on a weekday.")
 
-          if now.time() >= time(15, 10):
+          if now.time() >= time(15, 15):
               raise SystemExit(
-                  "STOP: It is 15:10 IST or later. "
+                  "STOP: It is 15:15 IST or later. "
                   "Run before the afternoon observation window ends."
               )
           PY
