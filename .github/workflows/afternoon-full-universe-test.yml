@@ -32,24 +32,24 @@ jobs:
           cache: pip
           cache-dependency-path: Scanner/requirements.txt
 
-      - name: Check trading day and time
-        run: |
-          python - <<'PY'
-          from datetime import datetime, time
-          from zoneinfo import ZoneInfo
+     # - name: Check trading day and time
+       # run: |
+        #  python - <<'PY'
+        #  from datetime import datetime, time
+        #  from zoneinfo import ZoneInfo
 
-          now = datetime.now(ZoneInfo("Asia/Kolkata"))
-          print(f"Current India time: {now:%Y-%m-%d %H:%M:%S %Z}")
+        #  now = datetime.now(ZoneInfo("Asia/Kolkata"))
+        #  print(f"Current India time: {now:%Y-%m-%d %H:%M:%S %Z}")
 
-          if now.weekday() >= 7:
-              raise SystemExit("STOP: Saturday/Sunday. Run on a weekday.")
+        #  if now.weekday() >= 7:
+         #     raise SystemExit("STOP: Saturday/Sunday. Run on a weekday.")
 
-          if now.time() >= time(15, 15):
-              raise SystemExit(
-                  "STOP: It is 15:15 IST or later. "
-                  "Run before the afternoon observation window ends."
-              )
-          PY
+         # if now.time() >= time(15, 15):
+           #   raise SystemExit(
+           #       "STOP: It is 15:15 IST or later. "
+            #      "Run before the afternoon observation window ends."
+            #  )
+         # PY
 
       - name: Install scanner dependencies
         run: python -m pip install -r requirements.txt
