@@ -1,9 +1,9 @@
 name: Daily Scan and Report
 
 on:
-  schedule:
+  #schedule:
     # 11:02 UTC = 4:32 PM IST, Monday-Friday.
-    - cron: '2 11 * * 1-5'
+    #- cron: '2 11 * * 1-5'
   workflow_dispatch:
 
 permissions:
@@ -229,6 +229,7 @@ jobs:
           REPORT_FILE: ${{ steps.prepare_workbook.outputs.report_file }}
           GMAIL_SENDER: ${{ secrets.GMAIL_SENDER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           REPORT_RECIPIENT: sa2337308@gmail.com
         run: python send_scan_report.py "$REPORT_FILE"
 

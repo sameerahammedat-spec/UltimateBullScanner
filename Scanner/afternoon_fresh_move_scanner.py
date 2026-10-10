@@ -969,7 +969,7 @@ class AfternoonScanner:
                 f"move={item.get('window_move_pct'):5.2f}% rvol={item.get('same_window_rvol')} "
                 f"{item.get('status')} | {item.get('catalyst_strength')}"
             )
-        return qualified, rejected
+        return reportable, rejected
 
     def write_outputs(self, now: datetime, qualified: List[Dict[str, Any]], rejected: List[Dict[str, Any]]) -> None:
         day = now.strftime("%Y-%m-%d")
